@@ -62,3 +62,26 @@ jobs:
           STATUS=$(curl --silent --output /tmp/history-invalid.json --write-out '%{http_code}' \
             'http://127.0.0.1:3101/api/history/banks?start=bad&end=2026-09-17&pair=USD%2FTRY')
           test "$STATUS" = "400"
+
+      - name: Live bank-history smoke test
+        if: matrix.node-version == '22.x'
+        continue-on-error: true
+        shell: bash
+        env:
+          PORT: "3102"
+          SESSION_SECRET: "ci-only-session-secret"
+        run: |
+          node app.js > /tmp/ymproje1-live.log 2>&1 &
+          APP_PID=$!
+          trap 'kill "$APP_PID" 2>/dev/null || true' EXIT
+
+          for i in {1..20}; do
+            curl --fail --silent http://127.0.0.1:3102/ > /dev/null && break
+            sleep 0.5
+          done
+
+          curl --fail --silent --max-time 60 \
+            'http://127.0.0.1:3102/api/history/banks?start=2026-09-01&end=2026-09-17&pair=USD%2FTRY' \
+            > /tmp/history-live.json
+
+          node -e "const fs=require('fs'); const p=JSON.parse(fs.readFileSync('/tmp/history-live.json','utf8')); if(!Array.isArray(p.series)||p.series.length!==3) process.exit(1); const names=p.series.map(x=>x.name); const counts=p.series.map(x=>Array.isArray(x.points)?x.points.length:0); console.log({names,counts}); if(counts.every(x=>x===0)) process.exit(1);"
