@@ -9,9 +9,13 @@ const BANK_COLORS = {
 
 const BANK_ORDER = ['garanti', 'kuveyt', 'yapi'];
 const visibleBanks = new Set(BANK_ORDER);
+const MAX_HISTORY_YEARS = 10;
 
 let chartState = null;
 let resizeTimer = null;
+let requestController = null;
+let pointerFrame = null;
+let pendingPointer = null;
 
 function ensureChartStyles() {
   if (document.querySelector('#bank-history-chart-styles')) return;
@@ -19,6 +23,26 @@ function ensureChartStyles() {
   const style = document.createElement('style');
   style.id = 'bank-history-chart-styles';
   style.textContent = `
+    .chart-meta {
+      min-height: 1.2rem;
+      margin-top: .45rem;
+      color: #64748b;
+      font-size: .78rem;
+    }
+
+    .chart-meta:empty {
+      display: none;
+    }
+
+    .chart-meta--error {
+      color: #b91c1c;
+      font-weight: 650;
+    }
+
+    .chart-meta--info {
+      color: #64748b;
+    }
+
     .chart-wrap {
       position: relative;
       overflow: hidden;
@@ -27,6 +51,10 @@ function ensureChartStyles() {
       border-radius: 12px !important;
       background: #fff !important;
       box-shadow: inset 0 1px 0 rgba(15, 23, 42, .02);
+    }
+
+    .chart-wrap[aria-busy="true"] {
+      opacity: .78;
     }
 
     #range-chart {
@@ -98,7 +126,6 @@ function ensureChartStyles() {
       box-shadow: 0 14px 34px rgba(15, 23, 42, .24);
       pointer-events: none;
       backdrop-filter: blur(8px);
-      transform: translateZ(0);
     }
 
     .chart-tooltip.hidden {
@@ -112,7 +139,6 @@ function ensureChartStyles() {
       color: #e2e8f0;
       font-size: .78rem;
       font-weight: 700;
-      letter-spacing: .01em;
     }
 
     .chart-tooltip__row {
@@ -153,6 +179,16 @@ function ensureChartStyles() {
       font-size: .68rem;
     }
 
+    #range-10y-btn {
+      background: #eef4ff;
+      color: #1d4ed8;
+      border: 1px solid #c7d7fe;
+    }
+
+    #range-10y-btn:hover {
+      background: #e0eaff;
+    }
+
     @media (max-width: 700px) {
       #range-chart { height: 320px !important; }
       .chart-tooltip { min-width: 185px; }
@@ -170,26 +206,52 @@ function renderMeta(message, isError = false) {
   if (message) element.classList.add(isError ? 'chart-meta--error' : 'chart-meta--info');
 }
 
-function showLoading(message) {
-  const overlay = qs('#loading-overlay');
-  const text = qs('#loading-message');
-  if (text) text.textContent = message;
-  if (overlay) overlay.classList.remove('hidden');
+function setBusy(isBusy) {
+  const loadButton = qs('#range-load-btn');
+  const tenYearButton = qs('#range-10y-btn');
+  const wrap = qs('.chart-wrap');
+
+  if (loadButton) {
+    if (!loadButton.dataset.defaultText) {
+      loadButton.dataset.defaultText = loadButton.textContent || 'Grafiği Yükle';
+    }
+    loadButton.disabled = isBusy;
+    loadButton.textContent = isBusy ? 'Yükleniyor…' : loadButton.dataset.defaultText;
+  }
+
+  if (tenYearButton) tenYearButton.disabled = isBusy;
+  if (wrap) wrap.setAttribute('aria-busy', String(isBusy));
 }
 
-function hideLoading() {
-  const overlay = qs('#loading-overlay');
-  if (overlay) overlay.classList.add('hidden');
+function toInputDate(date) {
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
-function formatDateLabel(dateString) {
-  const [year, month, day] = String(dateString || '').split('-');
-  return year && month && day ? `${day}.${month}` : dateString;
+function parseDateOnly(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return null;
+  const date = new Date(`${value}T00:00:00Z`);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function daysBetween(start, end) {
+  const a = parseDateOnly(start);
+  const b = parseDateOnly(end);
+  if (!a || !b) return 0;
+  return Math.max(0, Math.round((b - a) / 86400000));
 }
 
 function formatFullDate(dateString) {
   const [year, month, day] = String(dateString || '').split('-');
   return year && month && day ? `${day}.${month}.${year}` : dateString;
+}
+
+function formatAxisDate(dateString, spanDays) {
+  const [year, month, day] = String(dateString || '').split('-');
+  if (!year || !month || !day) return dateString;
+
+  if (spanDays >= 730) return year;
+  if (spanDays >= 120) return `${month}.${year}`;
+  return `${day}.${month}`;
 }
 
 function formatPrice(value, pair) {
@@ -224,12 +286,15 @@ function normalizeSeries(series) {
         });
       }
 
+      const points = Array.from(dedup.values()).sort((a, b) => a.date.localeCompare(b.date));
       return {
         id: item?.id || 'unknown',
         name: item?.name || item?.id || 'Banka',
         error: item?.error || null,
+        warning: item?.warning || null,
         color: BANK_COLORS[item?.id] || '#2563eb',
-        points: Array.from(dedup.values()).sort((a, b) => a.date.localeCompare(b.date))
+        points,
+        pointMap: new Map(points.map((point) => [point.date, point]))
       };
     })
     .sort((a, b) => BANK_ORDER.indexOf(a.id) - BANK_ORDER.indexOf(b.id));
@@ -242,6 +307,7 @@ function visibleSeries(series) {
 function renderLegend(series) {
   const container = qs('#chart-legend');
   if (!container) return;
+
   container.textContent = '';
 
   for (const item of series.filter((entry) => entry.points.length > 0)) {
@@ -269,7 +335,8 @@ function renderLegend(series) {
 
     button.addEventListener('click', () => {
       if (visibleBanks.has(item.id)) {
-        if (visibleBanks.size === 1) return;
+        const activeCount = series.filter((entry) => visibleBanks.has(entry.id) && entry.points.length > 0).length;
+        if (activeCount <= 1) return;
         visibleBanks.delete(item.id);
       } else {
         visibleBanks.add(item.id);
@@ -318,7 +385,6 @@ function niceStep(range, targetTicks = 5) {
   if (normalized >= 5) nice = 5;
   else if (normalized >= 2.5) nice = 2.5;
   else if (normalized >= 2) nice = 2;
-  else if (normalized >= 1) nice = 1;
 
   return nice * magnitude;
 }
@@ -331,8 +397,7 @@ function buildScale(values) {
     const padValue = Math.max(Math.abs(rawMin) * 0.005, 0.05);
     return {
       min: rawMin - padValue,
-      max: rawMax + padValue,
-      step: niceStep(padValue * 2, 5)
+      max: rawMax + padValue
     };
   }
 
@@ -343,8 +408,7 @@ function buildScale(values) {
 
   return {
     min: Math.floor(paddedMin / step) * step,
-    max: Math.ceil(paddedMax / step) * step,
-    step
+    max: Math.ceil(paddedMax / step) * step
   };
 }
 
@@ -380,7 +444,7 @@ function setupCanvas(canvas) {
   ctx.imageSmoothingEnabled = true;
   ctx.clearRect(0, 0, cssWidth, cssHeight);
 
-  return { ctx, cssWidth, cssHeight, dpr };
+  return { ctx, cssWidth, cssHeight };
 }
 
 function drawRoundedRect(ctx, x, y, width, height, radius) {
@@ -392,6 +456,14 @@ function drawRoundedRect(ctx, x, y, width, height, radius) {
   ctx.arcTo(x, y + height, x, y, r);
   ctx.arcTo(x, y, x + width, y, r);
   ctx.closePath();
+}
+
+function renderEmptyChart(ctx, cssWidth, cssHeight, message) {
+  ctx.fillStyle = '#64748b';
+  ctx.font = '500 14px "Segoe UI", system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(message, cssWidth / 2, cssHeight / 2);
 }
 
 function renderChart() {
@@ -406,16 +478,14 @@ function renderChart() {
   const allDates = Array.from(
     new Set(activeSeries.flatMap((item) => item.points.map((point) => point.date)))
   ).sort();
+
   const values = activeSeries
     .flatMap((item) => item.points.map((point) => point.value))
     .filter(Number.isFinite);
 
   if (!values.length || !allDates.length) {
-    ctx.fillStyle = '#64748b';
-    ctx.font = '500 14px "Segoe UI", system-ui, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText('Gösterilecek banka geçmiş verisi bulunamadı.', cssWidth / 2, cssHeight / 2);
+    chartState.layout = null;
+    renderEmptyChart(ctx, cssWidth, cssHeight, 'Seçilen aralık için banka geçmiş verisi bulunamadı.');
     return;
   }
 
@@ -424,13 +494,14 @@ function renderChart() {
     top: 54,
     right: compact ? 20 : 30,
     bottom: 48,
-    left: compact ? 64 : 78
+    left: compact ? 66 : 82
   };
 
   const plotWidth = Math.max(80, cssWidth - padding.left - padding.right);
   const plotHeight = Math.max(80, cssHeight - padding.top - padding.bottom);
   const scale = buildScale(values);
   const scaleRange = scale.max - scale.min || 1;
+  const spanDays = daysBetween(allDates[0], allDates[allDates.length - 1]);
 
   const xForIndex = (index) =>
     allDates.length === 1
@@ -441,6 +512,20 @@ function renderChart() {
     padding.top + ((scale.max - value) / scaleRange) * plotHeight;
 
   const dateIndex = new Map(allDates.map((date, index) => [date, index]));
+  const seriesPixels = activeSeries.map((item) => ({
+    item,
+    pixels: item.points
+      .map((point) => ({
+        point,
+        index: dateIndex.get(point.date)
+      }))
+      .filter((entry) => entry.index != null && Number.isFinite(entry.point.value))
+      .map((entry) => ({
+        ...entry,
+        x: xForIndex(entry.index),
+        y: yFor(entry.point.value)
+      }))
+  }));
 
   chartState.layout = {
     padding,
@@ -451,9 +536,10 @@ function renderChart() {
     allDates,
     xForIndex,
     yFor,
-    dateIndex,
     activeSeries,
-    scale
+    seriesPixels,
+    scale,
+    spanDays
   };
 
   ctx.save();
@@ -461,14 +547,6 @@ function renderChart() {
   ctx.fillStyle = '#fbfdff';
   ctx.fill();
   ctx.clip();
-
-  const horizontalBands = 5;
-  for (let i = 0; i < horizontalBands; i += 1) {
-    if (i % 2 !== 0) continue;
-    const bandY = padding.top + (i / horizontalBands) * plotHeight;
-    ctx.fillStyle = 'rgba(248, 250, 252, .75)';
-    ctx.fillRect(padding.left, bandY, plotWidth, plotHeight / horizontalBands);
-  }
 
   const yTicks = 5;
   for (let i = 0; i <= yTicks; i += 1) {
@@ -483,7 +561,7 @@ function renderChart() {
     ctx.stroke();
   }
 
-  const maxDateTicks = compact ? 4 : Math.min(8, Math.max(4, Math.floor(plotWidth / 110)));
+  const maxDateTicks = compact ? 4 : Math.min(8, Math.max(4, Math.floor(plotWidth / 115)));
   const tickIndices = pickTickIndices(allDates.length, maxDateTicks);
   for (const index of tickIndices) {
     const x = Math.round(xForIndex(index)) + 0.5;
@@ -495,55 +573,48 @@ function renderChart() {
     ctx.stroke();
   }
 
-  for (const item of activeSeries) {
-    const usablePoints = item.points
-      .map((point) => ({ ...point, index: dateIndex.get(point.date) }))
-      .filter((point) => point.index != null && Number.isFinite(point.value));
+  const drawPointMarkers = allDates.length <= 120;
 
-    if (!usablePoints.length) continue;
+  for (const { item, pixels } of seriesPixels) {
+    if (!pixels.length) continue;
 
     ctx.save();
     ctx.strokeStyle = item.color;
-    ctx.globalAlpha = 0.12;
+    ctx.globalAlpha = 0.10;
     ctx.lineWidth = 7;
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
     ctx.beginPath();
-    usablePoints.forEach((point, index) => {
-      const x = xForIndex(point.index);
-      const y = yFor(point.value);
-      if (index === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+    pixels.forEach((entry, index) => {
+      if (index === 0) ctx.moveTo(entry.x, entry.y);
+      else ctx.lineTo(entry.x, entry.y);
     });
     ctx.stroke();
     ctx.restore();
 
     ctx.strokeStyle = item.color;
-    ctx.lineWidth = 2.4;
+    ctx.lineWidth = 2.35;
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
     ctx.beginPath();
-    usablePoints.forEach((point, index) => {
-      const x = xForIndex(point.index);
-      const y = yFor(point.value);
-      if (index === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+    pixels.forEach((entry, index) => {
+      if (index === 0) ctx.moveTo(entry.x, entry.y);
+      else ctx.lineTo(entry.x, entry.y);
     });
     ctx.stroke();
 
-    for (const point of usablePoints) {
-      const x = xForIndex(point.index);
-      const y = yFor(point.value);
+    if (drawPointMarkers) {
+      for (const entry of pixels) {
+        ctx.beginPath();
+        ctx.fillStyle = '#fff';
+        ctx.arc(entry.x, entry.y, 3.7, 0, Math.PI * 2);
+        ctx.fill();
 
-      ctx.beginPath();
-      ctx.fillStyle = '#fff';
-      ctx.arc(x, y, allDates.length > 60 ? 2.2 : 4.2, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.beginPath();
-      ctx.fillStyle = item.color;
-      ctx.arc(x, y, allDates.length > 60 ? 1.4 : 2.7, 0, Math.PI * 2);
-      ctx.fill();
+        ctx.beginPath();
+        ctx.fillStyle = item.color;
+        ctx.arc(entry.x, entry.y, 2.3, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
   }
 
@@ -552,7 +623,7 @@ function renderChart() {
     const hoverDate = allDates[hoverIndex];
     const x = xForIndex(hoverIndex);
 
-    ctx.strokeStyle = 'rgba(71, 85, 105, .55)';
+    ctx.strokeStyle = 'rgba(71, 85, 105, .6)';
     ctx.lineWidth = 1;
     ctx.setLineDash([4, 4]);
     ctx.beginPath();
@@ -562,7 +633,7 @@ function renderChart() {
     ctx.setLineDash([]);
 
     for (const item of activeSeries) {
-      const point = item.points.find((candidate) => candidate.date === hoverDate);
+      const point = item.pointMap.get(hoverDate);
       if (!point) continue;
 
       const y = yFor(point.value);
@@ -594,9 +665,13 @@ function renderChart() {
   ctx.textBaseline = 'alphabetic';
   ctx.textAlign = 'center';
 
+  let lastAxisLabel = null;
   for (const index of tickIndices) {
     const date = allDates[index];
-    ctx.fillText(formatDateLabel(date), xForIndex(index), cssHeight - 16);
+    const label = formatAxisDate(date, spanDays);
+    if (label === lastAxisLabel && index !== tickIndices[tickIndices.length - 1]) continue;
+    ctx.fillText(label, xForIndex(index), cssHeight - 16);
+    lastAxisLabel = label;
   }
 
   ctx.textAlign = 'left';
@@ -608,16 +683,21 @@ function renderChart() {
   ctx.font = '500 11px "Segoe UI", system-ui, sans-serif';
   const subtitle = allDates.length === 1
     ? `${formatFullDate(allDates[0])} · günlük kapanış`
-    : `${formatFullDate(allDates[0])} – ${formatFullDate(allDates[allDates.length - 1])} · günlük kapanış`;
+    : `${formatFullDate(allDates[0])} – ${formatFullDate(allDates[allDates.length - 1])} · ${allDates.length} veri günü`;
   ctx.fillText(subtitle, padding.left, 40);
+
+  canvas.setAttribute(
+    'aria-label',
+    `${pairLabel(chartState.pair)} için ${formatFullDate(allDates[0])} ile ${formatFullDate(allDates[allDates.length - 1])} arasındaki banka geçmiş grafiği`
+  );
 }
 
-function positionTooltip(event, tooltip, canvas) {
+function positionTooltip(clientX, clientY, tooltip, canvas) {
   const wrap = canvas.parentElement;
   const wrapRect = wrap.getBoundingClientRect();
   const tooltipRect = tooltip.getBoundingClientRect();
-  const localX = event.clientX - wrapRect.left;
-  const localY = event.clientY - wrapRect.top;
+  const localX = clientX - wrapRect.left;
+  const localY = clientY - wrapRect.top;
 
   let left = localX + 16;
   let top = localY + 16;
@@ -625,7 +705,6 @@ function positionTooltip(event, tooltip, canvas) {
   if (left + tooltipRect.width > wrapRect.width - 10) {
     left = localX - tooltipRect.width - 16;
   }
-
   if (top + tooltipRect.height > wrapRect.height - 10) {
     top = localY - tooltipRect.height - 16;
   }
@@ -634,7 +713,7 @@ function positionTooltip(event, tooltip, canvas) {
   tooltip.style.top = `${Math.max(10, top)}px`;
 }
 
-function showTooltipForPointer(event) {
+function processPointer(clientX, clientY) {
   const canvas = qs('#range-chart');
   const tooltip = ensureTooltip();
   const layout = chartState?.layout;
@@ -642,9 +721,9 @@ function showTooltipForPointer(event) {
   if (!canvas || !tooltip || !layout?.allDates?.length) return;
 
   const rect = canvas.getBoundingClientRect();
-  const x = event.clientX - rect.left;
-  const y = event.clientY - rect.top;
-  const { padding, plotWidth, plotHeight, allDates, xForIndex, activeSeries } = layout;
+  const x = clientX - rect.left;
+  const y = clientY - rect.top;
+  const { padding, plotWidth, plotHeight, allDates, activeSeries } = layout;
 
   if (
     x < padding.left ||
@@ -660,16 +739,10 @@ function showTooltipForPointer(event) {
     return;
   }
 
-  let nearestIndex = 0;
-  let nearestDistance = Infinity;
-
-  for (let index = 0; index < allDates.length; index += 1) {
-    const distance = Math.abs(x - xForIndex(index));
-    if (distance < nearestDistance) {
-      nearestDistance = distance;
-      nearestIndex = index;
-    }
-  }
+  const ratio = plotWidth > 0 ? (x - padding.left) / plotWidth : 0;
+  const nearestIndex = allDates.length === 1
+    ? 0
+    : Math.max(0, Math.min(allDates.length - 1, Math.round(ratio * (allDates.length - 1))));
 
   if (chartState.hoverIndex !== nearestIndex) {
     chartState.hoverIndex = nearestIndex;
@@ -679,7 +752,7 @@ function showTooltipForPointer(event) {
   const date = allDates[nearestIndex];
   const rows = activeSeries
     .map((item) => {
-      const point = item.points.find((candidate) => candidate.date === date);
+      const point = item.pointMap.get(date);
       return point ? { item, point } : null;
     })
     .filter(Boolean);
@@ -728,10 +801,28 @@ function showTooltipForPointer(event) {
   tooltip.appendChild(hint);
 
   tooltip.classList.remove('hidden');
-  positionTooltip(event, tooltip, canvas);
+  positionTooltip(clientX, clientY, tooltip, canvas);
+}
+
+function queuePointer(event) {
+  pendingPointer = { clientX: event.clientX, clientY: event.clientY };
+  if (pointerFrame != null) return;
+
+  pointerFrame = requestAnimationFrame(() => {
+    pointerFrame = null;
+    if (!pendingPointer) return;
+    const pointer = pendingPointer;
+    pendingPointer = null;
+    processPointer(pointer.clientX, pointer.clientY);
+  });
 }
 
 function clearHover() {
+  pendingPointer = null;
+  if (pointerFrame != null) {
+    cancelAnimationFrame(pointerFrame);
+    pointerFrame = null;
+  }
   if (chartState?.hoverIndex != null) {
     chartState.hoverIndex = null;
     renderChart();
@@ -744,9 +835,8 @@ function bindCanvasInteractions(canvas) {
   canvas.dataset.historyBound = '1';
   canvas.tabIndex = 0;
   canvas.setAttribute('role', 'img');
-  canvas.setAttribute('aria-label', 'Banka geçmiş kur grafiği. Fare ile veri noktalarının üzerine gelerek fiyatları görebilirsiniz.');
 
-  canvas.addEventListener('pointermove', showTooltipForPointer);
+  canvas.addEventListener('pointermove', queuePointer);
   canvas.addEventListener('pointerleave', clearHover);
   canvas.addEventListener('pointercancel', clearHover);
 }
@@ -755,11 +845,13 @@ function drawBankHistory(rawSeries, pair, start, end) {
   const canvas = qs('#range-chart');
   if (!canvas || typeof canvas.getContext !== 'function') return;
 
-  ensureChartStyles();
   hideTooltip();
-
   const series = normalizeSeries(rawSeries).filter((item) => item.points.length > 0);
-  for (const item of series) visibleBanks.add(item.id);
+
+  const currentlyVisible = series.some((item) => visibleBanks.has(item.id));
+  if (!currentlyVisible) {
+    for (const item of series) visibleBanks.add(item.id);
+  }
 
   chartState = {
     series,
@@ -775,28 +867,44 @@ function drawBankHistory(rawSeries, pair, start, end) {
   renderChart();
 }
 
+function validateRange(start, end) {
+  const startDate = parseDateOnly(start);
+  const endDate = parseDateOnly(end);
+  if (!startDate || !endDate) return 'Lütfen geçerli başlangıç ve bitiş tarihini seçin.';
+  if (startDate > endDate) return 'Başlangıç tarihi bitiş tarihinden büyük olamaz.';
+
+  const today = parseDateOnly(toInputDate(new Date()));
+  if (today && endDate > today) return 'Gelecek tarih için geçmiş veri sorgulanamaz.';
+
+  const maxEnd = new Date(startDate);
+  maxEnd.setUTCFullYear(maxEnd.getUTCFullYear() + MAX_HISTORY_YEARS);
+  if (endDate > maxEnd) return `Tek sorguda en fazla ${MAX_HISTORY_YEARS} yıllık aralık seçilebilir.`;
+
+  return null;
+}
+
 async function loadHistoryChart() {
   const start = qs('#range-start-date')?.value || '';
   const end = qs('#range-end-date')?.value || '';
   const pair = qs('#chart-pair')?.value || 'USD/TRY';
 
-  if (!start || !end) {
-    renderMeta('Lütfen başlangıç ve bitiş tarihini seçin.', true);
+  const validationError = validateRange(start, end);
+  if (validationError) {
+    renderMeta(validationError, true);
     return;
   }
 
-  if (start > end) {
-    renderMeta('Başlangıç tarihi bitiş tarihinden büyük olamaz.', true);
-    return;
-  }
+  if (requestController) requestController.abort();
+  requestController = new AbortController();
 
   renderMeta('');
-  showLoading(`${start} - ${end} banka geçmiş verileri çekiliyor...`);
+  setBusy(true);
 
   try {
     const params = new URLSearchParams({ start, end, pair });
     const response = await fetch(`/api/history/banks?${params.toString()}`, {
-      cache: 'no-store'
+      cache: 'no-store',
+      signal: requestController.signal
     });
     const payload = await response.json().catch(() => ({}));
 
@@ -808,21 +916,32 @@ async function loadHistoryChart() {
     const populated = series.filter((item) => Array.isArray(item?.points) && item.points.length > 0);
 
     if (!populated.length) {
-      chartState = null;
       drawBankHistory([], pair, start, end);
       renderMeta(`${start} - ${end} aralığında banka geçmiş verisi bulunamadı.`, true);
       return;
     }
 
     drawBankHistory(series, pair, start, end);
-    renderMeta('');
+
+    const issues = series
+      .filter((item) => item?.error || item?.warning)
+      .map((item) => item?.name)
+      .filter(Boolean);
+
+    if (issues.length) {
+      renderMeta(`Bazı geçmiş veriler eksik olabilir: ${issues.join(', ')}.`, true);
+    } else {
+      renderMeta('');
+    }
   } catch (error) {
+    if (error?.name === 'AbortError') return;
+
     console.error('[historyDataLoader]', error);
-    chartState = null;
     drawBankHistory([], pair, start, end);
-    renderMeta(`Banka geçmiş verileri çekilemedi: ${error.message}`, true);
+    renderMeta(`Banka geçmiş verileri çekilemedi: ${error?.message || error}`, true);
   } finally {
-    hideLoading();
+    requestController = null;
+    setBusy(false);
   }
 }
 
@@ -831,36 +950,81 @@ function configureDateInputs() {
   const endInput = qs('#range-end-date');
   if (!startInput || !endInput) return;
 
-  const now = new Date();
-  const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  const todayDate = new Date();
+  const oldestDate = new Date(todayDate);
+  oldestDate.setFullYear(oldestDate.getFullYear() - MAX_HISTORY_YEARS);
 
-  startInput.min = '2020-01-01';
-  endInput.min = '2020-01-01';
+  const today = toInputDate(todayDate);
+  const oldest = toInputDate(oldestDate);
+
+  startInput.min = oldest;
+  endInput.min = oldest;
   startInput.max = today;
   endInput.max = today;
 
-  if (!endInput.value) endInput.value = today;
+  if (!endInput.value || endInput.value > today || endInput.value < oldest) {
+    endInput.value = today;
+  }
 
-  if (!startInput.value) {
-    const start = new Date(now);
-    start.setDate(start.getDate() - 30);
-    startInput.value = `${start.getFullYear()}-${pad(start.getMonth() + 1)}-${pad(start.getDate())}`;
+  if (!startInput.value || startInput.value > endInput.value || startInput.value < oldest) {
+    const defaultStart = new Date(todayDate);
+    defaultStart.setDate(defaultStart.getDate() - 30);
+    startInput.value = toInputDate(defaultStart < oldestDate ? oldestDate : defaultStart);
   }
 }
 
-function takeOwnershipOfChartButton() {
-  const button = qs('#range-load-btn');
-  if (!button || button.dataset.historyBound === '1') return;
+function ensureTenYearButton() {
+  const loadButton = qs('#range-load-btn');
+  if (!loadButton || qs('#range-10y-btn')) return;
 
-  button.dataset.historyBound = '1';
-  button.addEventListener('click', (event) => {
-    event.preventDefault();
-    event.stopImmediatePropagation();
+  const button = document.createElement('button');
+  button.id = 'range-10y-btn';
+  button.type = 'button';
+  button.className = 'btn btn-sm';
+  button.textContent = 'Son 10 Yıl';
+  button.title = 'Son 10 yıllık banka geçmişini getir';
+
+  button.addEventListener('click', () => {
+    const startInput = qs('#range-start-date');
+    const endInput = qs('#range-end-date');
+    if (!startInput || !endInput) return;
+
+    const todayDate = new Date();
+    const oldestDate = new Date(todayDate);
+    oldestDate.setFullYear(oldestDate.getFullYear() - MAX_HISTORY_YEARS);
+
+    startInput.value = toInputDate(oldestDate);
+    endInput.value = toInputDate(todayDate);
     void loadHistoryChart();
-  }, true);
+  });
+
+  loadButton.parentElement?.insertBefore(button, loadButton);
+}
+
+function bindControls() {
+  const loadButton = qs('#range-load-btn');
+  if (loadButton && loadButton.dataset.historyBound !== '1') {
+    loadButton.dataset.historyBound = '1';
+    loadButton.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void loadHistoryChart();
+    }, true);
+  }
+
+  const pairSelect = qs('#chart-pair');
+  if (pairSelect && pairSelect.dataset.historyBound !== '1') {
+    pairSelect.dataset.historyBound = '1';
+    pairSelect.addEventListener('change', () => {
+      if (chartState?.series?.length) void loadHistoryChart();
+    });
+  }
 }
 
 function bindResize() {
+  if (document.documentElement.dataset.historyResizeBound === '1') return;
+  document.documentElement.dataset.historyResizeBound = '1';
+
   window.addEventListener('resize', () => {
     if (!chartState) return;
     clearTimeout(resizeTimer);
@@ -872,12 +1036,31 @@ function bindResize() {
   });
 }
 
+function renderInitialMessage() {
+  const canvas = qs('#range-chart');
+  if (!canvas || typeof canvas.getContext !== 'function') return;
+
+  chartState = {
+    series: [],
+    pair: qs('#chart-pair')?.value || 'USD/TRY',
+    start: '',
+    end: '',
+    hoverIndex: null,
+    layout: null
+  };
+
+  const setup = setupCanvas(canvas);
+  if (!setup) return;
+  renderEmptyChart(setup.ctx, setup.cssWidth, setup.cssHeight, 'Tarih aralığını seçip “Grafiği Yükle” butonuna basın.');
+}
+
 if (typeof document !== 'undefined') {
   document.addEventListener('DOMContentLoaded', () => {
     ensureChartStyles();
     configureDateInputs();
-    takeOwnershipOfChartButton();
+    ensureTenYearButton();
+    bindControls();
     bindResize();
-    setTimeout(configureDateInputs, 800);
+    renderInitialMessage();
   });
 }
