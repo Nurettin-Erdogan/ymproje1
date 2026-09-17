@@ -1,6 +1,12 @@
 const qs = (selector) => document.querySelector(selector);
 const pad = (value) => String(value).padStart(2, '0');
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_HISTORY_YEARS = 10;
+const MAX_POINT_MARKERS = 120;
+const MAX_GLOW_POINTS = 1200;
+const LINE_GAP_DAYS = 7;
+
 const BANK_COLORS = {
   garanti: '#e11d48',
   kuveyt: '#059669',
@@ -9,11 +15,10 @@ const BANK_COLORS = {
 
 const BANK_ORDER = ['garanti', 'kuveyt', 'yapi'];
 const visibleBanks = new Set(BANK_ORDER);
-const MAX_HISTORY_YEARS = 10;
 
 let chartState = null;
-let resizeTimer = null;
 let requestController = null;
+let resizeTimer = null;
 let pointerFrame = null;
 let pendingPointer = null;
 
@@ -29,19 +34,9 @@ function ensureChartStyles() {
       color: #64748b;
       font-size: .78rem;
     }
-
-    .chart-meta:empty {
-      display: none;
-    }
-
-    .chart-meta--error {
-      color: #b91c1c;
-      font-weight: 650;
-    }
-
-    .chart-meta--info {
-      color: #64748b;
-    }
+    .chart-meta:empty { display: none; }
+    .chart-meta--error { color: #b91c1c; font-weight: 650; }
+    .chart-meta--info { color: #64748b; }
 
     .chart-wrap {
       position: relative;
@@ -52,18 +47,20 @@ function ensureChartStyles() {
       background: #fff !important;
       box-shadow: inset 0 1px 0 rgba(15, 23, 42, .02);
     }
-
-    .chart-wrap[aria-busy="true"] {
-      opacity: .78;
-    }
+    .chart-wrap[aria-busy="true"] { opacity: .78; }
 
     #range-chart {
       display: block;
       width: 100% !important;
-      height: 360px !important;
+      height: 380px !important;
       cursor: crosshair;
       touch-action: pan-y;
       user-select: none;
+      outline: none;
+    }
+    #range-chart:focus-visible {
+      box-shadow: inset 0 0 0 2px #2563eb;
+      border-radius: 11px;
     }
 
     .chart-legend {
@@ -73,7 +70,6 @@ function ensureChartStyles() {
       margin-top: .8rem;
       margin-bottom: .8rem;
     }
-
     .chart-legend__item {
       appearance: none;
       display: inline-flex;
@@ -92,19 +88,16 @@ function ensureChartStyles() {
       cursor: pointer;
       transition: transform .12s ease, box-shadow .12s ease, opacity .12s ease, background .12s ease;
     }
-
     .chart-legend__item:hover {
       transform: translateY(-1px);
       box-shadow: 0 4px 12px rgba(15, 23, 42, .08);
       background: #f8fafc;
     }
-
     .chart-legend__item.is-muted {
       opacity: .42;
       background: #f8fafc;
       border-left-color: #94a3b8;
     }
-
     .chart-legend__dot {
       width: 9px;
       height: 9px;
@@ -117,7 +110,7 @@ function ensureChartStyles() {
       position: absolute;
       z-index: 20;
       min-width: 205px;
-      max-width: min(290px, calc(100% - 20px));
+      max-width: min(300px, calc(100% - 20px));
       padding: 11px 12px;
       border: 1px solid rgba(148, 163, 184, .45);
       border-radius: 10px;
@@ -127,11 +120,7 @@ function ensureChartStyles() {
       pointer-events: none;
       backdrop-filter: blur(8px);
     }
-
-    .chart-tooltip.hidden {
-      display: none !important;
-    }
-
+    .chart-tooltip.hidden { display: none !important; }
     .chart-tooltip__date {
       margin-bottom: 8px;
       padding-bottom: 7px;
@@ -140,7 +129,6 @@ function ensureChartStyles() {
       font-size: .78rem;
       font-weight: 700;
     }
-
     .chart-tooltip__row {
       display: flex;
       align-items: center;
@@ -148,7 +136,6 @@ function ensureChartStyles() {
       gap: 16px;
       margin-top: 7px;
     }
-
     .chart-tooltip__bank {
       display: inline-flex;
       align-items: center;
@@ -158,21 +145,18 @@ function ensureChartStyles() {
       font-size: .8rem;
       white-space: nowrap;
     }
-
     .chart-tooltip__dot {
       width: 8px;
       height: 8px;
       flex: 0 0 8px;
       border-radius: 999px;
     }
-
     .chart-tooltip__value {
       color: #fff;
       font-size: .84rem;
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
     }
-
     .chart-tooltip__hint {
       margin-top: 8px;
       color: #94a3b8;
@@ -184,13 +168,10 @@ function ensureChartStyles() {
       color: #1d4ed8;
       border: 1px solid #c7d7fe;
     }
-
-    #range-10y-btn:hover {
-      background: #e0eaff;
-    }
+    #range-10y-btn:hover { background: #e0eaff; }
 
     @media (max-width: 700px) {
-      #range-chart { height: 320px !important; }
+      #range-chart { height: 330px !important; }
       .chart-tooltip { min-width: 185px; }
       .chart-legend__item { font-size: .76rem; padding: .38rem .62rem; }
     }
@@ -230,14 +211,20 @@ function toInputDate(date) {
 function parseDateOnly(value) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return null;
   const date = new Date(`${value}T00:00:00Z`);
-  return Number.isNaN(date.getTime()) ? null : date;
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString().slice(0, 10) === value ? date : null;
+}
+
+function dateToTimestamp(value) {
+  const date = parseDateOnly(value);
+  return date ? date.getTime() : NaN;
 }
 
 function daysBetween(start, end) {
-  const a = parseDateOnly(start);
-  const b = parseDateOnly(end);
-  if (!a || !b) return 0;
-  return Math.max(0, Math.round((b - a) / 86400000));
+  const a = dateToTimestamp(start);
+  const b = dateToTimestamp(end);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return 0;
+  return Math.max(0, Math.round((b - a) / DAY_MS));
 }
 
 function formatFullDate(dateString) {
@@ -248,7 +235,6 @@ function formatFullDate(dateString) {
 function formatAxisDate(dateString, spanDays) {
   const [year, month, day] = String(dateString || '').split('-');
   if (!year || !month || !day) return dateString;
-
   if (spanDays >= 730) return year;
   if (spanDays >= 120) return `${month}.${year}`;
   return `${day}.${month}`;
@@ -271,28 +257,30 @@ function normalizeSeries(series) {
     .map((item) => {
       const dedup = new Map();
 
-      for (const point of Array.isArray(item?.points) ? item.points : []) {
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(point?.date || '')) continue;
-        const value = Number(point?.value ?? point?.close);
-        if (!Number.isFinite(value)) continue;
+      for (const rawPoint of Array.isArray(item?.points) ? item.points : []) {
+        const date = String(rawPoint?.date || '');
+        const timestamp = dateToTimestamp(date);
+        const value = Number(rawPoint?.value ?? rawPoint?.close);
+        if (!Number.isFinite(timestamp) || !Number.isFinite(value)) continue;
 
-        dedup.set(point.date, {
-          date: point.date,
+        dedup.set(date, {
+          date,
+          timestamp,
           value,
-          open: Number.isFinite(Number(point.open)) ? Number(point.open) : null,
-          high: Number.isFinite(Number(point.high)) ? Number(point.high) : null,
-          low: Number.isFinite(Number(point.low)) ? Number(point.low) : null,
-          close: Number.isFinite(Number(point.close)) ? Number(point.close) : value
+          open: Number.isFinite(Number(rawPoint.open)) ? Number(rawPoint.open) : null,
+          high: Number.isFinite(Number(rawPoint.high)) ? Number(rawPoint.high) : null,
+          low: Number.isFinite(Number(rawPoint.low)) ? Number(rawPoint.low) : null,
+          close: Number.isFinite(Number(rawPoint.close)) ? Number(rawPoint.close) : value
         });
       }
 
-      const points = Array.from(dedup.values()).sort((a, b) => a.date.localeCompare(b.date));
+      const points = Array.from(dedup.values()).sort((a, b) => a.timestamp - b.timestamp);
       return {
         id: item?.id || 'unknown',
         name: item?.name || item?.id || 'Banka',
+        color: BANK_COLORS[item?.id] || '#2563eb',
         error: item?.error || null,
         warning: item?.warning || null,
-        color: BANK_COLORS[item?.id] || '#2563eb',
         points,
         pointMap: new Map(points.map((point) => [point.date, point]))
       };
@@ -307,7 +295,6 @@ function visibleSeries(series) {
 function renderLegend(series) {
   const container = qs('#chart-legend');
   if (!container) return;
-
   container.textContent = '';
 
   for (const item of series.filter((entry) => entry.points.length > 0)) {
@@ -318,7 +305,6 @@ function renderLegend(series) {
     button.style.color = item.color;
     button.setAttribute('aria-pressed', String(visibleBanks.has(item.id)));
     button.title = `${item.name} serisini göster/gizle`;
-
     if (!visibleBanks.has(item.id)) button.classList.add('is-muted');
 
     const dot = document.createElement('span');
@@ -342,12 +328,10 @@ function renderLegend(series) {
         visibleBanks.add(item.id);
       }
 
-      renderLegend(series);
+      chartState.hoverDate = null;
       hideTooltip();
-      if (chartState) {
-        chartState.hoverIndex = null;
-        renderChart();
-      }
+      renderLegend(series);
+      renderChart();
     });
 
     container.appendChild(button);
@@ -376,7 +360,6 @@ function hideTooltip() {
 
 function niceStep(range, targetTicks = 5) {
   if (!Number.isFinite(range) || range <= 0) return 1;
-
   const rough = range / Math.max(2, targetTicks);
   const magnitude = 10 ** Math.floor(Math.log10(rough));
   const normalized = rough / magnitude;
@@ -385,7 +368,6 @@ function niceStep(range, targetTicks = 5) {
   if (normalized >= 5) nice = 5;
   else if (normalized >= 2.5) nice = 2.5;
   else if (normalized >= 2) nice = 2;
-
   return nice * magnitude;
 }
 
@@ -394,56 +376,72 @@ function buildScale(values) {
   const rawMax = Math.max(...values);
 
   if (rawMin === rawMax) {
-    const padValue = Math.max(Math.abs(rawMin) * 0.005, 0.05);
-    return {
-      min: rawMin - padValue,
-      max: rawMax + padValue
-    };
+    const padding = Math.max(Math.abs(rawMin) * 0.005, 0.05);
+    return { min: rawMin - padding, max: rawMax + padding };
   }
 
   const padding = (rawMax - rawMin) * 0.10;
   const paddedMin = rawMin - padding;
   const paddedMax = rawMax + padding;
   const step = niceStep(paddedMax - paddedMin, 5);
-
   return {
     min: Math.floor(paddedMin / step) * step,
     max: Math.ceil(paddedMax / step) * step
   };
 }
 
-function pickTickIndices(count, maxTicks) {
-  if (count <= 0) return [];
-  if (count <= maxTicks) return Array.from({ length: count }, (_, index) => index);
+function nearestTimestampIndex(timestamps, target) {
+  if (!timestamps.length) return -1;
+  if (target <= timestamps[0]) return 0;
+  const last = timestamps.length - 1;
+  if (target >= timestamps[last]) return last;
 
-  const indices = new Set([0, count - 1]);
-  for (let i = 1; i < maxTicks - 1; i += 1) {
-    indices.add(Math.round((i * (count - 1)) / (maxTicks - 1)));
+  let low = 0;
+  let high = last;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if (timestamps[mid] === target) return mid;
+    if (timestamps[mid] < target) low = mid + 1;
+    else high = mid - 1;
   }
+
+  return Math.abs(timestamps[low] - target) < Math.abs(timestamps[high] - target) ? low : high;
+}
+
+function buildTimeTickIndices(timestamps, maxTicks) {
+  if (!timestamps.length) return [];
+  if (timestamps.length <= maxTicks) return timestamps.map((_, index) => index);
+
+  const first = timestamps[0];
+  const last = timestamps[timestamps.length - 1];
+  const indices = new Set([0, timestamps.length - 1]);
+
+  for (let i = 1; i < maxTicks - 1; i += 1) {
+    const target = first + ((last - first) * i) / (maxTicks - 1);
+    const index = nearestTimestampIndex(timestamps, target);
+    if (index >= 0) indices.add(index);
+  }
+
   return Array.from(indices).sort((a, b) => a - b);
 }
 
 function setupCanvas(canvas) {
   const rect = canvas.getBoundingClientRect();
   const cssWidth = Math.max(320, Math.round(rect.width || canvas.clientWidth || 960));
-  const cssHeight = window.innerWidth <= 700 ? 320 : 360;
+  const cssHeight = window.innerWidth <= 700 ? 330 : 380;
   const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
 
   canvas.style.height = `${cssHeight}px`;
-
   const targetWidth = Math.round(cssWidth * dpr);
   const targetHeight = Math.round(cssHeight * dpr);
-
   if (canvas.width !== targetWidth) canvas.width = targetWidth;
   if (canvas.height !== targetHeight) canvas.height = targetHeight;
 
   const ctx = canvas.getContext('2d');
   if (!ctx) return null;
-
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.imageSmoothingEnabled = true;
   ctx.clearRect(0, 0, cssWidth, cssHeight);
-
   return { ctx, cssWidth, cssHeight };
 }
 
@@ -466,65 +464,64 @@ function renderEmptyChart(ctx, cssWidth, cssHeight, message) {
   ctx.fillText(message, cssWidth / 2, cssHeight / 2);
 }
 
+function traceSeries(ctx, pixels) {
+  ctx.beginPath();
+  let started = false;
+  let previousTimestamp = null;
+
+  for (const entry of pixels) {
+    const hasLargeGap = previousTimestamp != null &&
+      (entry.point.timestamp - previousTimestamp) / DAY_MS > LINE_GAP_DAYS;
+
+    if (!started || hasLargeGap) {
+      ctx.moveTo(entry.x, entry.y);
+      started = true;
+    } else {
+      ctx.lineTo(entry.x, entry.y);
+    }
+
+    previousTimestamp = entry.point.timestamp;
+  }
+}
+
 function renderChart() {
   const canvas = qs('#range-chart');
   if (!canvas || !chartState) return;
 
   const setup = setupCanvas(canvas);
   if (!setup) return;
-
   const { ctx, cssWidth, cssHeight } = setup;
+
   const activeSeries = visibleSeries(chartState.series);
-  const allDates = Array.from(
-    new Set(activeSeries.flatMap((item) => item.points.map((point) => point.date)))
-  ).sort();
+  const allDates = Array.from(new Set(activeSeries.flatMap((item) => item.points.map((point) => point.date)))).sort();
+  const timestamps = allDates.map(dateToTimestamp).filter(Number.isFinite);
+  const values = activeSeries.flatMap((item) => item.points.map((point) => point.value)).filter(Number.isFinite);
 
-  const values = activeSeries
-    .flatMap((item) => item.points.map((point) => point.value))
-    .filter(Number.isFinite);
-
-  if (!values.length || !allDates.length) {
+  if (!values.length || !allDates.length || timestamps.length !== allDates.length) {
     chartState.layout = null;
     renderEmptyChart(ctx, cssWidth, cssHeight, 'Seçilen aralık için banka geçmiş verisi bulunamadı.');
     return;
   }
 
   const compact = cssWidth < 700;
-  const padding = {
-    top: 54,
-    right: compact ? 20 : 30,
-    bottom: 48,
-    left: compact ? 66 : 82
-  };
-
+  const padding = { top: 58, right: compact ? 18 : 28, bottom: 50, left: compact ? 66 : 82 };
   const plotWidth = Math.max(80, cssWidth - padding.left - padding.right);
   const plotHeight = Math.max(80, cssHeight - padding.top - padding.bottom);
   const scale = buildScale(values);
   const scaleRange = scale.max - scale.min || 1;
-  const spanDays = daysBetween(allDates[0], allDates[allDates.length - 1]);
+  const minTimestamp = timestamps[0];
+  const maxTimestamp = timestamps[timestamps.length - 1];
+  const timeRange = maxTimestamp - minTimestamp || 1;
+  const spanDays = Math.round(timeRange / DAY_MS);
 
-  const xForIndex = (index) =>
-    allDates.length === 1
-      ? padding.left + plotWidth / 2
-      : padding.left + (index / (allDates.length - 1)) * plotWidth;
+  const xForTimestamp = (timestamp) => allDates.length === 1
+    ? padding.left + plotWidth / 2
+    : padding.left + ((timestamp - minTimestamp) / timeRange) * plotWidth;
+  const yFor = (value) => padding.top + ((scale.max - value) / scaleRange) * plotHeight;
 
-  const yFor = (value) =>
-    padding.top + ((scale.max - value) / scaleRange) * plotHeight;
-
-  const dateIndex = new Map(allDates.map((date, index) => [date, index]));
   const seriesPixels = activeSeries.map((item) => ({
     item,
-    pixels: item.points
-      .map((point) => ({
-        point,
-        index: dateIndex.get(point.date)
-      }))
-      .filter((entry) => entry.index != null && Number.isFinite(entry.point.value))
-      .map((entry) => ({
-        ...entry,
-        x: xForIndex(entry.index),
-        y: yFor(entry.point.value)
-      }))
+    pixels: item.points.map((point) => ({ point, x: xForTimestamp(point.timestamp), y: yFor(point.value) }))
   }));
 
   chartState.layout = {
@@ -534,10 +531,12 @@ function renderChart() {
     cssWidth,
     cssHeight,
     allDates,
-    xForIndex,
+    timestamps,
+    minTimestamp,
+    maxTimestamp,
+    xForTimestamp,
     yFor,
     activeSeries,
-    seriesPixels,
     scale,
     spanDays
   };
@@ -552,7 +551,6 @@ function renderChart() {
   for (let i = 0; i <= yTicks; i += 1) {
     const y = padding.top + (i / yTicks) * plotHeight;
     const crispY = Math.round(y) + 0.5;
-
     ctx.strokeStyle = i === yTicks ? '#cbd5e1' : '#e2e8f0';
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -562,9 +560,9 @@ function renderChart() {
   }
 
   const maxDateTicks = compact ? 4 : Math.min(8, Math.max(4, Math.floor(plotWidth / 115)));
-  const tickIndices = pickTickIndices(allDates.length, maxDateTicks);
+  const tickIndices = buildTimeTickIndices(timestamps, maxDateTicks);
   for (const index of tickIndices) {
-    const x = Math.round(xForIndex(index)) + 0.5;
+    const x = Math.round(xForTimestamp(timestamps[index])) + 0.5;
     ctx.strokeStyle = '#eef2f7';
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -573,34 +571,29 @@ function renderChart() {
     ctx.stroke();
   }
 
-  const drawPointMarkers = allDates.length <= 120;
+  const drawPointMarkers = allDates.length <= MAX_POINT_MARKERS;
+  const drawGlow = allDates.length <= MAX_GLOW_POINTS;
 
   for (const { item, pixels } of seriesPixels) {
     if (!pixels.length) continue;
 
-    ctx.save();
-    ctx.strokeStyle = item.color;
-    ctx.globalAlpha = 0.10;
-    ctx.lineWidth = 7;
-    ctx.lineJoin = 'round';
-    ctx.lineCap = 'round';
-    ctx.beginPath();
-    pixels.forEach((entry, index) => {
-      if (index === 0) ctx.moveTo(entry.x, entry.y);
-      else ctx.lineTo(entry.x, entry.y);
-    });
-    ctx.stroke();
-    ctx.restore();
+    if (drawGlow) {
+      ctx.save();
+      ctx.strokeStyle = item.color;
+      ctx.globalAlpha = 0.10;
+      ctx.lineWidth = 7;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      traceSeries(ctx, pixels);
+      ctx.stroke();
+      ctx.restore();
+    }
 
     ctx.strokeStyle = item.color;
     ctx.lineWidth = 2.35;
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
-    ctx.beginPath();
-    pixels.forEach((entry, index) => {
-      if (index === 0) ctx.moveTo(entry.x, entry.y);
-      else ctx.lineTo(entry.x, entry.y);
-    });
+    traceSeries(ctx, pixels);
     ctx.stroke();
 
     if (drawPointMarkers) {
@@ -609,7 +602,6 @@ function renderChart() {
         ctx.fillStyle = '#fff';
         ctx.arc(entry.x, entry.y, 3.7, 0, Math.PI * 2);
         ctx.fill();
-
         ctx.beginPath();
         ctx.fillStyle = item.color;
         ctx.arc(entry.x, entry.y, 2.3, 0, Math.PI * 2);
@@ -618,32 +610,31 @@ function renderChart() {
     }
   }
 
-  const hoverIndex = Number.isInteger(chartState.hoverIndex) ? chartState.hoverIndex : null;
-  if (hoverIndex != null && allDates[hoverIndex]) {
-    const hoverDate = allDates[hoverIndex];
-    const x = xForIndex(hoverIndex);
-
-    ctx.strokeStyle = 'rgba(71, 85, 105, .6)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath();
-    ctx.moveTo(x, padding.top);
-    ctx.lineTo(x, padding.top + plotHeight);
-    ctx.stroke();
-    ctx.setLineDash([]);
-
-    for (const item of activeSeries) {
-      const point = item.pointMap.get(hoverDate);
-      if (!point) continue;
-
-      const y = yFor(point.value);
+  if (chartState.hoverDate) {
+    const hoverTimestamp = dateToTimestamp(chartState.hoverDate);
+    if (Number.isFinite(hoverTimestamp)) {
+      const x = xForTimestamp(hoverTimestamp);
+      ctx.strokeStyle = 'rgba(71, 85, 105, .6)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
       ctx.beginPath();
-      ctx.fillStyle = '#fff';
-      ctx.strokeStyle = item.color;
-      ctx.lineWidth = 2.5;
-      ctx.arc(x, y, 5.2, 0, Math.PI * 2);
-      ctx.fill();
+      ctx.moveTo(x, padding.top);
+      ctx.lineTo(x, padding.top + plotHeight);
       ctx.stroke();
+      ctx.setLineDash([]);
+
+      for (const item of activeSeries) {
+        const point = item.pointMap.get(chartState.hoverDate);
+        if (!point) continue;
+        const y = yFor(point.value);
+        ctx.beginPath();
+        ctx.fillStyle = '#fff';
+        ctx.strokeStyle = item.color;
+        ctx.lineWidth = 2.5;
+        ctx.arc(x, y, 5.2, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
     }
   }
 
@@ -653,38 +644,34 @@ function renderChart() {
   ctx.font = '500 12px "Segoe UI", system-ui, sans-serif';
   ctx.textBaseline = 'middle';
   ctx.textAlign = 'right';
-
   for (let i = 0; i <= yTicks; i += 1) {
     const y = padding.top + (i / yTicks) * plotHeight;
     const value = scale.max - (i / yTicks) * scaleRange;
     ctx.fillText(formatPrice(value, chartState.pair), padding.left - 10, y);
   }
 
-  ctx.fillStyle = '#64748b';
-  ctx.font = '500 12px "Segoe UI", system-ui, sans-serif';
   ctx.textBaseline = 'alphabetic';
   ctx.textAlign = 'center';
-
   let lastAxisLabel = null;
   for (const index of tickIndices) {
     const date = allDates[index];
     const label = formatAxisDate(date, spanDays);
     if (label === lastAxisLabel && index !== tickIndices[tickIndices.length - 1]) continue;
-    ctx.fillText(label, xForIndex(index), cssHeight - 16);
+    ctx.fillText(label, xForTimestamp(timestamps[index]), cssHeight - 16);
     lastAxisLabel = label;
   }
 
   ctx.textAlign = 'left';
   ctx.fillStyle = '#0f172a';
   ctx.font = '700 14px "Segoe UI", system-ui, sans-serif';
-  ctx.fillText(`${pairLabel(chartState.pair)} banka geçmiş grafiği`, padding.left, 22);
+  ctx.fillText(`${pairLabel(chartState.pair)} banka geçmiş grafiği`, padding.left, 24);
 
   ctx.fillStyle = '#64748b';
   ctx.font = '500 11px "Segoe UI", system-ui, sans-serif';
   const subtitle = allDates.length === 1
     ? `${formatFullDate(allDates[0])} · günlük kapanış`
     : `${formatFullDate(allDates[0])} – ${formatFullDate(allDates[allDates.length - 1])} · ${allDates.length} veri günü`;
-  ctx.fillText(subtitle, padding.left, 40);
+  ctx.fillText(subtitle, padding.left, 43);
 
   canvas.setAttribute(
     'aria-label',
@@ -701,55 +688,19 @@ function positionTooltip(clientX, clientY, tooltip, canvas) {
 
   let left = localX + 16;
   let top = localY + 16;
-
-  if (left + tooltipRect.width > wrapRect.width - 10) {
-    left = localX - tooltipRect.width - 16;
-  }
-  if (top + tooltipRect.height > wrapRect.height - 10) {
-    top = localY - tooltipRect.height - 16;
-  }
+  if (left + tooltipRect.width > wrapRect.width - 10) left = localX - tooltipRect.width - 16;
+  if (top + tooltipRect.height > wrapRect.height - 10) top = localY - tooltipRect.height - 16;
 
   tooltip.style.left = `${Math.max(10, left)}px`;
   tooltip.style.top = `${Math.max(10, top)}px`;
 }
 
-function processPointer(clientX, clientY) {
+function renderTooltip(date, clientX, clientY) {
   const canvas = qs('#range-chart');
   const tooltip = ensureTooltip();
-  const layout = chartState?.layout;
+  const activeSeries = chartState?.layout?.activeSeries || [];
+  if (!canvas || !tooltip || !date) return;
 
-  if (!canvas || !tooltip || !layout?.allDates?.length) return;
-
-  const rect = canvas.getBoundingClientRect();
-  const x = clientX - rect.left;
-  const y = clientY - rect.top;
-  const { padding, plotWidth, plotHeight, allDates, activeSeries } = layout;
-
-  if (
-    x < padding.left ||
-    x > padding.left + plotWidth ||
-    y < padding.top ||
-    y > padding.top + plotHeight
-  ) {
-    if (chartState.hoverIndex != null) {
-      chartState.hoverIndex = null;
-      renderChart();
-    }
-    hideTooltip();
-    return;
-  }
-
-  const ratio = plotWidth > 0 ? (x - padding.left) / plotWidth : 0;
-  const nearestIndex = allDates.length === 1
-    ? 0
-    : Math.max(0, Math.min(allDates.length - 1, Math.round(ratio * (allDates.length - 1))));
-
-  if (chartState.hoverIndex !== nearestIndex) {
-    chartState.hoverIndex = nearestIndex;
-    renderChart();
-  }
-
-  const date = allDates[nearestIndex];
   const rows = activeSeries
     .map((item) => {
       const point = item.pointMap.get(date);
@@ -763,7 +714,6 @@ function processPointer(clientX, clientY) {
   }
 
   tooltip.textContent = '';
-
   const title = document.createElement('div');
   title.className = 'chart-tooltip__date';
   title.textContent = formatFullDate(date);
@@ -775,14 +725,11 @@ function processPointer(clientX, clientY) {
 
     const label = document.createElement('span');
     label.className = 'chart-tooltip__bank';
-
     const dot = document.createElement('span');
     dot.className = 'chart-tooltip__dot';
     dot.style.background = item.color;
-
     const name = document.createElement('span');
     name.textContent = item.name;
-
     label.appendChild(dot);
     label.appendChild(name);
 
@@ -799,9 +746,36 @@ function processPointer(clientX, clientY) {
   hint.className = 'chart-tooltip__hint';
   hint.textContent = 'Günlük kapanış';
   tooltip.appendChild(hint);
-
   tooltip.classList.remove('hidden');
   positionTooltip(clientX, clientY, tooltip, canvas);
+}
+
+function processPointer(clientX, clientY) {
+  const canvas = qs('#range-chart');
+  const layout = chartState?.layout;
+  if (!canvas || !layout?.allDates?.length) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const x = clientX - rect.left;
+  const y = clientY - rect.top;
+  const { padding, plotWidth, plotHeight, timestamps, minTimestamp, maxTimestamp, allDates } = layout;
+
+  if (x < padding.left || x > padding.left + plotWidth || y < padding.top || y > padding.top + plotHeight) {
+    clearHover();
+    return;
+  }
+
+  const ratio = plotWidth > 0 ? Math.max(0, Math.min(1, (x - padding.left) / plotWidth)) : 0;
+  const targetTimestamp = minTimestamp + ratio * (maxTimestamp - minTimestamp);
+  const index = nearestTimestampIndex(timestamps, targetTimestamp);
+  if (index < 0) return;
+
+  const date = allDates[index];
+  if (chartState.hoverDate !== date) {
+    chartState.hoverDate = date;
+    renderChart();
+  }
+  renderTooltip(date, clientX, clientY);
 }
 
 function queuePointer(event) {
@@ -823,8 +797,8 @@ function clearHover() {
     cancelAnimationFrame(pointerFrame);
     pointerFrame = null;
   }
-  if (chartState?.hoverIndex != null) {
-    chartState.hoverIndex = null;
+  if (chartState?.hoverDate) {
+    chartState.hoverDate = null;
     renderChart();
   }
   hideTooltip();
@@ -835,7 +809,6 @@ function bindCanvasInteractions(canvas) {
   canvas.dataset.historyBound = '1';
   canvas.tabIndex = 0;
   canvas.setAttribute('role', 'img');
-
   canvas.addEventListener('pointermove', queuePointer);
   canvas.addEventListener('pointerleave', clearHover);
   canvas.addEventListener('pointercancel', clearHover);
@@ -847,9 +820,7 @@ function drawBankHistory(rawSeries, pair, start, end) {
 
   hideTooltip();
   const series = normalizeSeries(rawSeries).filter((item) => item.points.length > 0);
-
-  const currentlyVisible = series.some((item) => visibleBanks.has(item.id));
-  if (!currentlyVisible) {
+  if (!series.some((item) => visibleBanks.has(item.id))) {
     for (const item of series) visibleBanks.add(item.id);
   }
 
@@ -858,7 +829,7 @@ function drawBankHistory(rawSeries, pair, start, end) {
     pair,
     start,
     end,
-    hoverIndex: null,
+    hoverDate: null,
     layout: null
   };
 
@@ -879,7 +850,6 @@ function validateRange(start, end) {
   const maxEnd = new Date(startDate);
   maxEnd.setUTCFullYear(maxEnd.getUTCFullYear() + MAX_HISTORY_YEARS);
   if (endDate > maxEnd) return `Tek sorguda en fazla ${MAX_HISTORY_YEARS} yıllık aralık seçilebilir.`;
-
   return null;
 }
 
@@ -895,7 +865,8 @@ async function loadHistoryChart() {
   }
 
   if (requestController) requestController.abort();
-  requestController = new AbortController();
+  const controller = new AbortController();
+  requestController = controller;
 
   renderMeta('');
   setBusy(true);
@@ -904,13 +875,12 @@ async function loadHistoryChart() {
     const params = new URLSearchParams({ start, end, pair });
     const response = await fetch(`/api/history/banks?${params.toString()}`, {
       cache: 'no-store',
-      signal: requestController.signal
+      signal: controller.signal
     });
     const payload = await response.json().catch(() => ({}));
 
-    if (!response.ok) {
-      throw new Error(payload?.error || `HTTP ${response.status}`);
-    }
+    if (requestController !== controller) return;
+    if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
 
     const series = Array.isArray(payload?.series) ? payload.series : [];
     const populated = series.filter((item) => Array.isArray(item?.points) && item.points.length > 0);
@@ -922,26 +892,18 @@ async function loadHistoryChart() {
     }
 
     drawBankHistory(series, pair, start, end);
-
-    const issues = series
-      .filter((item) => item?.error || item?.warning)
-      .map((item) => item?.name)
-      .filter(Boolean);
-
-    if (issues.length) {
-      renderMeta(`Bazı geçmiş veriler eksik olabilir: ${issues.join(', ')}.`, true);
-    } else {
-      renderMeta('');
-    }
+    const issues = series.filter((item) => item?.error || item?.warning).map((item) => item?.name).filter(Boolean);
+    renderMeta(issues.length ? `Bazı geçmiş veriler eksik olabilir: ${issues.join(', ')}.` : '', issues.length > 0);
   } catch (error) {
-    if (error?.name === 'AbortError') return;
-
+    if (error?.name === 'AbortError' || requestController !== controller) return;
     console.error('[historyDataLoader]', error);
     drawBankHistory([], pair, start, end);
     renderMeta(`Banka geçmiş verileri çekilemedi: ${error?.message || error}`, true);
   } finally {
-    requestController = null;
-    setBusy(false);
+    if (requestController === controller) {
+      requestController = null;
+      setBusy(false);
+    }
   }
 }
 
@@ -953,7 +915,6 @@ function configureDateInputs() {
   const todayDate = new Date();
   const oldestDate = new Date(todayDate);
   oldestDate.setFullYear(oldestDate.getFullYear() - MAX_HISTORY_YEARS);
-
   const today = toInputDate(todayDate);
   const oldest = toInputDate(oldestDate);
 
@@ -962,10 +923,7 @@ function configureDateInputs() {
   startInput.max = today;
   endInput.max = today;
 
-  if (!endInput.value || endInput.value > today || endInput.value < oldest) {
-    endInput.value = today;
-  }
-
+  if (!endInput.value || endInput.value > today || endInput.value < oldest) endInput.value = today;
   if (!startInput.value || startInput.value > endInput.value || startInput.value < oldest) {
     const defaultStart = new Date(todayDate);
     defaultStart.setDate(defaultStart.getDate() - 30);
@@ -992,7 +950,6 @@ function ensureTenYearButton() {
     const todayDate = new Date();
     const oldestDate = new Date(todayDate);
     oldestDate.setFullYear(oldestDate.getFullYear() - MAX_HISTORY_YEARS);
-
     startInput.value = toInputDate(oldestDate);
     endInput.value = toInputDate(todayDate);
     void loadHistoryChart();
@@ -1030,7 +987,7 @@ function bindResize() {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       hideTooltip();
-      chartState.hoverIndex = null;
+      chartState.hoverDate = null;
       renderChart();
     }, 120);
   });
@@ -1045,7 +1002,7 @@ function renderInitialMessage() {
     pair: qs('#chart-pair')?.value || 'USD/TRY',
     start: '',
     end: '',
-    hoverIndex: null,
+    hoverDate: null,
     layout: null
   };
 
