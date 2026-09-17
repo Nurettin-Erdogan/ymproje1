@@ -1,55 +1,8 @@
-function formatRelativeTime(dateString) {
-  if (!dateString) return '-';
-  const d = new Date(dateString);
-  if (Number.isNaN(d.getTime())) return '-';
-  const now = new Date();
-  const diffMs = now - d;
-  const diffSec = Math.floor(diffMs / 1000);
-  if (diffSec < 60) return 'şimdi';
-  const diffMin = Math.floor(diffSec / 60);
-  const diffHour = Math.floor(diffMin / 60);
-  if (diffMin < 60) return `${diffMin} dk önce`;
-  if (diffHour < 24) return `${diffHour} saat önce`;
-  const diffDay = Math.floor(diffHour / 24);
-  if (diffDay < 7) return `${diffDay} gün önce`;
-  // 7 gün ve fazlası için kısa tarih göster
-  const pad = (n) => n.toString().padStart(2, '0');
-  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()}`;
-}
-function formatShortDateTime(dateString) {
-  if (!dateString) return '-';
-  const d = new Date(dateString);
-  if (Number.isNaN(d.getTime())) return '-';
-  const pad = (n) => n.toString().padStart(2, '0');
-  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-function getFreshnessClass(dateString) {
-  if (!dateString) return 'freshness--unknown';
-  const d = new Date(dateString);
-  if (Number.isNaN(d.getTime())) return 'freshness--unknown';
-  const now = new Date();
-  const diffMs = now - d;
-  const diffMin = Math.floor(diffMs / 1000 / 60);
-  const diffHour = Math.floor(diffMin / 60);
-  const diffDay = Math.floor(diffHour / 24);
-
-  if (diffMin < 60 * 24) return 'freshness--fresh';
-  if (diffDay < 7) return 'freshness--warn';
-  return 'freshness--stale';
-}
-function normalizeProviderName(name) {
-  if (!name) return '';
-  return String(name)
-    .normalize('NFD')
-    .replace(/\p{Diacritic}/gu, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
-}
 import { parseAllProviders } from './scrapeClientParser.js';
 
 const DATA_BASE_URL = globalThis.__SCRAPE_BASE_URL__ || 'https://fatihedu.github.io/ymproje1';
+const SELECTED_PAIRS = ['USD/TRY', 'EUR/TRY', 'GBP/TRY', 'XAU/TRY'];
+const PROVIDER_ORDER = ['garanti', 'kuveyt', 'yapi'];
 
 const SELECTORS = {
   usdValue: '#val-usd',
@@ -62,81 +15,42 @@ const SELECTORS = {
   goldChange: '#chg-gold',
   listBody: '#currency-list-body',
   listMeta: '#currency-list-meta',
-  rangeStartInput: '#range-start-date',
-  rangeEndInput: '#range-end-date',
-  rangeButton: '#range-load-btn',
-  chartPair: '#chart-pair',
-  chartCanvas: '#range-chart',
-  chartLegend: '#chart-legend',
-  chartMeta: '#chart-meta',
   loadingOverlay: '#loading-overlay',
   loadingMessage: '#loading-message'
 };
 
-function qs(selector) {
-  return document.querySelector(selector);
-}
+const qs = (selector) => document.querySelector(selector);
 
-// state for sorting and last loaded rows (used when user toggles sort)
 let latestLoadedRows = [];
+let latestRunStartedAt = null;
 let currentSort = { key: null, asc: true };
-let latestSnapshotCache = null;
-let currentMonthlyEntriesCache = null;
-let chartLastSeries = [];
-let chartLastPair = 'USD/TRY';
-let chartVisibleSeriesIds = new Set();
-let chartLegendSignature = '';
-let chartPointPixels = [];
-let chartHoverIndex = null;
+let isLoggedIn = false;
+let csrfToken = '';
+let favoriteSet = new Set();
 let loadingDepth = 0;
+let latestLoadPromise = null;
+let lastSuccessfulLoadAt = 0;
 
-const CHART_EMPTY_SELECTION_MESSAGE = 'Lütfen en az 1 adet banka ya da ortalama seçin.';
-const CHART_PALETTE = ['#e11d48', '#059669', '#f59e0b', '#8b5cf6', '#06b6d4'];
-
-function clearSortIndicators() {
-  document.querySelectorAll('th[data-sort]').forEach((el) => {
-    el.classList.remove('asc', 'desc');
-    const btn = el.querySelector('.sort-btn');
-    if (btn) btn.textContent = '⇅';
-    const indicator = el.querySelector('.sort-indicator');
-    if (indicator) indicator.textContent = '';
-  });
+function normalizeProviderName(name) {
+  if (!name) return '';
+  return String(name)
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
 }
 
-function updateSortIndicator() {
-  clearSortIndicators();
-  if (!currentSort.key) return;
-  const th = document.querySelector(`th[data-sort="${currentSort.key}"]`);
-  if (th) {
-    th.classList.add(currentSort.asc ? 'asc' : 'desc');
-    const btn = th.querySelector('.sort-btn');
-    if (btn) btn.textContent = currentSort.asc ? '▲' : '▼';
-  }
-}
-
-function wireSortHeaders() {
-  const headers = Array.from(document.querySelectorAll('th[data-sort]'));
-  headers.forEach((th) => {
-    th.classList.add('th-sortable');
-    th.addEventListener('click', () => {
-      const key = th.getAttribute('data-sort');
-      if (currentSort.key === key) {
-        currentSort.asc = !currentSort.asc;
-      } else {
-        currentSort.key = key;
-        currentSort.asc = true;
-      }
-      updateSortIndicator();
-      renderCurrencyList(latestLoadedRows);
-    });
-  });
+function favoriteKey(pair, providerName) {
+  return `${pair}::${normalizeProviderName(providerName)}`;
 }
 
 function showLoading(message = 'Yükleniyor...') {
   const overlay = qs(SELECTORS.loadingOverlay);
-  const msg = qs(SELECTORS.loadingMessage);
+  const text = qs(SELECTORS.loadingMessage);
+
   loadingDepth += 1;
-  if (msg) msg.textContent = message;
+  if (text) text.textContent = message;
   if (overlay) overlay.classList.remove('hidden');
 }
 
@@ -146,65 +60,329 @@ function hideLoading() {
   if (loadingDepth === 0 && overlay) overlay.classList.add('hidden');
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function formatNumber(value, fractionDigits = 4) {
-  if (value == null || !Number.isFinite(value)) return '-';
+  const num = Number(value);
+  if (!Number.isFinite(num)) return '-';
+
   return new Intl.NumberFormat('tr-TR', {
     minimumFractionDigits: fractionDigits,
     maximumFractionDigits: fractionDigits
-  }).format(value);
+  }).format(num);
 }
 
 function formatPct(value) {
-  if (value == null || !Number.isFinite(value)) return '';
-  const sign = value > 0 ? '+' : '';
-  return `${sign}${formatNumber(value, 2)}%`;
+  const num = Number(value);
+  if (!Number.isFinite(num)) return '';
+  const sign = num > 0 ? '+' : '';
+  return `${sign}${formatNumber(num, 2)}%`;
+}
+
+function formatShortDateTime(dateString) {
+  if (!dateString) return '-';
+  const date = new Date(dateString);
+  if (Number.isNaN(date.getTime())) return '-';
+
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${pad(date.getDate())}.${pad(date.getMonth() + 1)}.${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatRelativeTime(dateString) {
+  if (!dateString) return '-';
+  const date = new Date(dateString);
+  if (Number.isNaN(date.getTime())) return '-';
+
+  const diffMs = Math.max(0, Date.now() - date.getTime());
+  const minutes = Math.floor(diffMs / 60000);
+
+  if (minutes < 1) return 'şimdi';
+  if (minutes < 60) return `${minutes} dk önce`;
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} saat önce`;
+
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days} gün önce`;
+
+  return formatShortDateTime(dateString).split(' ')[0];
+}
+
+function getFreshnessClass(dateString) {
+  if (!dateString) return 'freshness--unknown';
+  const date = new Date(dateString);
+  if (Number.isNaN(date.getTime())) return 'freshness--unknown';
+
+  const minutes = Math.max(0, Math.floor((Date.now() - date.getTime()) / 60000));
+  if (minutes < 24 * 60) return 'freshness--fresh';
+  if (minutes < 7 * 24 * 60) return 'freshness--warn';
+  return 'freshness--stale';
 }
 
 function setText(selector, text) {
-  const el = qs(selector);
-  if (el) el.textContent = text;
+  const element = qs(selector);
+  if (element) element.textContent = text;
 }
 
 function setChange(selector, value) {
-  const el = qs(selector);
-  if (!el) return;
+  const element = qs(selector);
+  if (!element) return;
 
-  el.textContent = formatPct(value);
-  el.classList.remove('up', 'down');
-  if (value > 0) el.classList.add('up');
-  if (value < 0) el.classList.add('down');
+  const num = Number(value);
+  element.textContent = Number.isFinite(num) ? formatPct(num) : '';
+  element.classList.remove('up', 'down');
+
+  if (num > 0) element.classList.add('up');
+  if (num < 0) element.classList.add('down');
 }
 
-function getBestPerPair(rows, pairCandidates) {
-  const matches = rows.filter((r) => pairCandidates.includes(r.pair));
+function renderListMeta(message, isError = false) {
+  const element = qs(SELECTORS.listMeta);
+  if (!element) return;
+
+  element.textContent = message || '';
+  element.classList.toggle('text-danger', Boolean(isError));
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, { cache: 'no-store', ...options });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} for ${url}`);
+  }
+  return response.json();
+}
+
+function latestDataUrl() {
+  const url = new URL(`${DATA_BASE_URL}/latest_all.json`);
+  url.searchParams.set('_', String(Date.now()));
+  return url.toString();
+}
+
+function filterVisibleRows(rows) {
+  return (Array.isArray(rows) ? rows : []).filter((row) => SELECTED_PAIRS.includes(row.pair));
+}
+
+function getPairAverage(rows, pair) {
+  const matches = rows.filter((row) => row.pair === pair);
   if (!matches.length) return null;
 
-  // Use arithmetic mean across providers for a stable single summary value.
-  const parityValues = matches.map((m) => m.parity).filter(Number.isFinite);
-  const changeValues = matches.map((m) => m.changePct).filter(Number.isFinite);
+  const parityValues = matches.map((row) => Number(row.parity)).filter(Number.isFinite);
+  const changeValues = matches.map((row) => Number(row.changePct)).filter(Number.isFinite);
 
-  const parity = parityValues.length
-    ? parityValues.reduce((a, b) => a + b, 0) / parityValues.length
-    : null;
-
-  const changePct = changeValues.length
-    ? changeValues.reduce((a, b) => a + b, 0) / changeValues.length
-    : null;
-
-  return { parity, changePct };
+  return {
+    parity: parityValues.length
+      ? parityValues.reduce((sum, value) => sum + value, 0) / parityValues.length
+      : null,
+    changePct: changeValues.length
+      ? changeValues.reduce((sum, value) => sum + value, 0) / changeValues.length
+      : null
+  };
 }
 
-const SELECTED_PAIRS = ['USD/TRY', 'EUR/TRY', 'GBP/TRY', 'XAU/TRY'];
-let isLoggedIn = false;
-let csrfToken = '';
-let favoriteSet = new Set();
+function updateSummaryCards(rows) {
+  const usd = getPairAverage(rows, 'USD/TRY');
+  const eur = getPairAverage(rows, 'EUR/TRY');
+  const gbp = getPairAverage(rows, 'GBP/TRY');
+  const gold = getPairAverage(rows, 'XAU/TRY');
 
-function favoriteKey(pair, providerName) {
-  return `${pair}::${normalizeProviderName(providerName)}`;
+  setText(SELECTORS.usdValue, formatNumber(usd?.parity));
+  setChange(SELECTORS.usdChange, usd?.changePct);
+
+  setText(SELECTORS.eurValue, formatNumber(eur?.parity));
+  setChange(SELECTORS.eurChange, eur?.changePct);
+
+  setText(SELECTORS.gbpValue, formatNumber(gbp?.parity));
+  setChange(SELECTORS.gbpChange, gbp?.changePct);
+
+  setText(SELECTORS.goldValue, formatNumber(gold?.parity));
+  setChange(SELECTORS.goldChange, gold?.changePct);
+}
+
+function providerRank(providerId) {
+  const index = PROVIDER_ORDER.indexOf(providerId);
+  return index === -1 ? PROVIDER_ORDER.length : index;
+}
+
+function compareRows(a, b) {
+  if (currentSort.key === 'buy' || currentSort.key === 'sell' || currentSort.key === 'spread') {
+    const aValue = Number(a[currentSort.key]);
+    const bValue = Number(b[currentSort.key]);
+    const aValid = Number.isFinite(aValue);
+    const bValid = Number.isFinite(bValue);
+
+    if (!aValid && !bValid) return 0;
+    if (!aValid) return 1;
+    if (!bValid) return -1;
+
+    return currentSort.asc ? aValue - bValue : bValue - aValue;
+  }
+
+  const rankDiff = providerRank(a.providerId) - providerRank(b.providerId);
+  if (rankDiff !== 0) return rankDiff;
+  return String(a.providerName || '').localeCompare(String(b.providerName || ''), 'tr');
+}
+
+function clearSortIndicators() {
+  document.querySelectorAll('th[data-sort]').forEach((header) => {
+    header.classList.remove('asc', 'desc');
+    const button = header.querySelector('.sort-btn');
+    if (button) button.textContent = '⇅';
+  });
+}
+
+function updateSortIndicator() {
+  clearSortIndicators();
+  if (!currentSort.key) return;
+
+  const header = document.querySelector(`th[data-sort="${currentSort.key}"]`);
+  if (!header) return;
+
+  header.classList.add(currentSort.asc ? 'asc' : 'desc');
+  const button = header.querySelector('.sort-btn');
+  if (button) button.textContent = currentSort.asc ? '▲' : '▼';
+}
+
+function wireSortHeaders() {
+  document.querySelectorAll('th[data-sort]').forEach((header) => {
+    if (header.dataset.sortBound === '1') return;
+    header.dataset.sortBound = '1';
+    header.classList.add('th-sortable');
+
+    header.addEventListener('click', () => {
+      const key = header.dataset.sort;
+      if (!key) return;
+
+      if (currentSort.key === key) {
+        currentSort.asc = !currentSort.asc;
+      } else {
+        currentSort = { key, asc: true };
+      }
+
+      updateSortIndicator();
+      renderCurrencyList(latestLoadedRows);
+    });
+  });
+}
+
+function createCell(text, className = '') {
+  const cell = document.createElement('td');
+  if (className) cell.className = className;
+  cell.textContent = text;
+  return cell;
+}
+
+function renderCurrencyList(rows) {
+  const body = qs(SELECTORS.listBody);
+  if (!body) return;
+
+  const safeRows = Array.isArray(rows) ? rows.slice() : [];
+  latestLoadedRows = safeRows;
+  body.textContent = '';
+
+  if (!safeRows.length) {
+    const emptyRow = document.createElement('tr');
+    const cell = document.createElement('td');
+    cell.colSpan = 7;
+    cell.className = 'text-center text-muted';
+    cell.textContent = 'Kur verisi bulunamadı.';
+    emptyRow.appendChild(cell);
+    body.appendChild(emptyRow);
+    return;
+  }
+
+  const groups = new Map(SELECTED_PAIRS.map((pair) => [pair, []]));
+  for (const row of safeRows) {
+    if (groups.has(row.pair)) groups.get(row.pair).push(row);
+  }
+
+  for (const pair of SELECTED_PAIRS) {
+    const pairRows = groups.get(pair) || [];
+    if (!pairRows.length) continue;
+
+    pairRows.sort(compareRows);
+
+    const headerRow = document.createElement('tr');
+    headerRow.className = 'currency-group-row';
+
+    const headerCell = document.createElement('td');
+    headerCell.colSpan = 7;
+
+    const group = document.createElement('div');
+    group.className = 'currency-group';
+
+    const groupName = document.createElement('span');
+    groupName.className = 'currency-group__name';
+    groupName.textContent = pair === 'XAU/TRY' ? 'ALTIN' : pair;
+
+    group.appendChild(groupName);
+    headerCell.appendChild(group);
+    headerRow.appendChild(headerCell);
+    body.appendChild(headerRow);
+
+    for (const row of pairRows) {
+      const tr = document.createElement('tr');
+      tr.className = 'bank-row';
+
+      const favoriteCell = document.createElement('td');
+      favoriteCell.className = 'col-fav';
+
+      if (isLoggedIn) {
+        const isFavorite = favoriteSet.has(favoriteKey(row.pair, row.providerName));
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = `fav-btn${isFavorite ? ' is-active' : ''}`;
+        button.dataset.pair = row.pair;
+        button.dataset.provider = row.providerName;
+        button.setAttribute('aria-label', `${row.providerName} ${pair} favorisini ${isFavorite ? 'kaldır' : 'ekle'}`);
+        button.textContent = '★';
+        favoriteCell.appendChild(button);
+      }
+
+      tr.appendChild(favoriteCell);
+      tr.appendChild(createCell(row.providerName || '-'));
+      tr.appendChild(createCell(formatNumber(row.buy)));
+      tr.appendChild(createCell(formatNumber(row.sell)));
+      tr.appendChild(createCell(formatNumber(row.spread)));
+
+      const change = Number(row.changePct);
+      const changeClass = change > 0 ? 'up' : change < 0 ? 'down' : '';
+      tr.appendChild(createCell(formatPct(change), changeClass));
+
+      const freshnessCell = document.createElement('td');
+      const freshnessClass = getFreshnessClass(row.time);
+      freshnessCell.className = `last-updated ${freshnessClass}`;
+      freshnessCell.title = formatShortDateTime(row.time);
+      freshnessCell.dataset.time = row.time || '';
+
+      const freshnessWrap = document.createElement('div');
+      freshnessWrap.className = 'freshness-cell';
+
+      const freshnessDot = document.createElement('span');
+      freshnessDot.className = 'freshness-dot';
+
+      const freshnessText = document.createElement('span');
+      freshnessText.className = 'freshness-text';
+      freshnessText.textContent = formatRelativeTime(row.time);
+
+      freshnessWrap.appendChild(freshnessDot);
+      freshnessWrap.appendChild(freshnessText);
+      freshnessCell.appendChild(freshnessWrap);
+      tr.appendChild(freshnessCell);
+
+      body.appendChild(tr);
+    }
+  }
+
+  bindFavoriteButtons();
+}
+
+function refreshRelativeTimes() {
+  document.querySelectorAll('.last-updated[data-time]').forEach((cell) => {
+    const time = cell.dataset.time || '';
+    cell.classList.remove('freshness--fresh', 'freshness--warn', 'freshness--stale', 'freshness--unknown');
+    cell.classList.add(getFreshnessClass(time));
+
+    const text = cell.querySelector('.freshness-text');
+    if (text) text.textContent = formatRelativeTime(time);
+  });
 }
 
 async function initAuthState() {
@@ -231,1244 +409,154 @@ async function loadFavorites() {
 
   try {
     const data = await fetchJson('/api/favorites');
-    const list = Array.isArray(data?.favorites) ? data.favorites : [];
-    favoriteSet = new Set(list.map((f) => favoriteKey(f.pair, f.providerName)));
-  } catch {
-    favoriteSet = new Set();
-  }
-}
-
-async function refreshFavoritesOnResume() {
-  try {
-    await initAuthState();
-    await loadFavorites();
-    if (Array.isArray(latestLoadedRows) && latestLoadedRows.length > 0) {
-      renderCurrencyList(latestLoadedRows);
-      updateSortIndicator();
-    }
+    const favorites = Array.isArray(data?.favorites) ? data.favorites : [];
+    favoriteSet = new Set(
+      favorites.map((favorite) => favoriteKey(favorite.pair, favorite.providerName))
+    );
   } catch (error) {
-    console.warn('[homeDataLoader] favorites could not be refreshed on resume', error?.message || error);
+    console.warn('[homeDataLoader] favoriler alınamadı', error?.message || error);
+    favoriteSet = new Set();
   }
 }
 
 async function updateFavorite(pair, providerName, shouldAdd) {
   const token = await ensureCsrfToken();
   const body = new URLSearchParams({ pair, providerName }).toString();
-
   const url = shouldAdd ? '/api/favorites' : '/api/favorites/remove';
-  const res = await fetch(url, {
+
+  const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-      'x-csrf-token': token,
+      'x-csrf-token': token
     },
-    body,
+    body
   });
 
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(txt || `HTTP ${res.status}`);
+  if (!response.ok) {
+    const details = await response.text();
+    throw new Error(details || `HTTP ${response.status}`);
   }
 
-  const data = await res.json();
-  const list = Array.isArray(data?.favorites) ? data.favorites : [];
-  favoriteSet = new Set(list.map((f) => favoriteKey(f.pair, f.providerName)));
+  const data = await response.json();
+  const favorites = Array.isArray(data?.favorites) ? data.favorites : [];
+  favoriteSet = new Set(
+    favorites.map((favorite) => favoriteKey(favorite.pair, favorite.providerName))
+  );
 }
 
-function filterVisibleRows(rows) {
-  return rows.filter((row) => SELECTED_PAIRS.includes(row.pair));
-}
-
-function updateSummaryCards(rows) {
-  const usd = getBestPerPair(rows, ['USD/TRY']);
-  const eur = getBestPerPair(rows, ['EUR/TRY']);
-  const gbp = getBestPerPair(rows, ['GBP/TRY']);
-  const gold = getBestPerPair(rows, ['XAU/TRY', 'ALT/TRY']);
-
-  setText(SELECTORS.usdValue, formatNumber(usd?.parity));
-  setChange(SELECTORS.usdChange, usd?.changePct ?? null);
-
-  setText(SELECTORS.eurValue, formatNumber(eur?.parity));
-  setChange(SELECTORS.eurChange, eur?.changePct ?? null);
-
-  setText(SELECTORS.gbpValue, formatNumber(gbp?.parity));
-  setChange(SELECTORS.gbpChange, gbp?.changePct ?? null);
-
-  setText(SELECTORS.goldValue, formatNumber(gold?.parity));
-  setChange(SELECTORS.goldChange, gold?.changePct ?? null);
-}
-
-function renderCurrencyList(rows) {
-  const body = qs(SELECTORS.listBody);
-  if (!body) return;
-  // keep latestLoadedRows in sync with what is being displayed so sorting works
-  latestLoadedRows = Array.isArray(rows) ? rows.slice() : [];
-
-  body.textContent = '';
-
-  if (!rows.length) {
-    const emptyRow = document.createElement('tr');
-    emptyRow.innerHTML = '<td colspan="7" class="text-center text-muted">Kur verisi bulunamadı.</td>';
-    body.appendChild(emptyRow);
-    return;
-  }
-
-  const groups = rows.reduce((map, row) => {
-    if (!map[row.pair]) map[row.pair] = [];
-    map[row.pair].push(row);
-    return map;
-  }, Object.create(null));
-
-  const sortedPairs = Object.keys(groups).sort((a, b) => a.localeCompare(b));
-
-  for (const pair of sortedPairs) {
-    const groupRowsUnsorted = groups[pair] || [];
-    let groupRows = groupRowsUnsorted.slice();
-    // numeric comparator that pushes invalid numbers to the end
-    const numericCompare = (ka, kb, asc = true) => (a, b) => {
-      const avRaw = a[ka];
-      const bvRaw = b[kb === ka ? ka : kb];
-      const av = Number(avRaw);
-      const bv = Number(bvRaw);
-      const aNaN = !Number.isFinite(av);
-      const bNaN = !Number.isFinite(bv);
-      if (aNaN && bNaN) return 0;
-      if (aNaN) return 1;
-      if (bNaN) return -1;
-      return asc ? av - bv : bv - av;
-    };
-
-    if (currentSort.key === 'spread') {
-      groupRows.sort(numericCompare('spread', 'spread', currentSort.asc));
-    } else if (currentSort.key === 'buy' || currentSort.key === 'sell') {
-      groupRows.sort(numericCompare(currentSort.key, currentSort.key, currentSort.asc));
-    } else {
-      groupRows.sort((a, b) => a.providerName.localeCompare(b.providerName));
-    }
-    const displayPair = pair === 'XAU/TRY' ? 'ALTIN' : pair;
-
-    const headerRow = document.createElement('tr');
-    headerRow.className = 'currency-group-row';
-    const headerTd = document.createElement('td');
-    headerTd.colSpan = 7;
-    const groupDiv = document.createElement('div');
-    groupDiv.className = 'currency-group';
-    const groupName = document.createElement('span');
-    groupName.className = 'currency-group__name';
-    groupName.textContent = displayPair;
-    groupDiv.appendChild(groupName);
-    headerTd.appendChild(groupDiv);
-    headerRow.appendChild(headerTd);
-    body.appendChild(headerRow);
-
-    for (const row of groupRows) {
-      const changeClass = row.changePct > 0 ? 'up' : row.changePct < 0 ? 'down' : '';
-      const key = favoriteKey(row.pair, row.providerName);
-      const isFav = favoriteSet.has(key);
-      const freshnessClass = getFreshnessClass(row.time);
-
-      const tr = document.createElement('tr');
-      tr.className = 'bank-row';
-
-      const favTd = document.createElement('td');
-      favTd.className = 'col-fav';
-      if (isLoggedIn) {
-        const favBtn = document.createElement('button');
-        favBtn.className = `fav-btn${isFav ? ' is-active' : ''}`;
-        favBtn.type = 'button';
-        favBtn.dataset.pair = row.pair;
-        favBtn.dataset.provider = row.providerName;
-        favBtn.setAttribute('aria-label', 'Favori');
-        favBtn.textContent = '★';
-        favTd.appendChild(favBtn);
-      }
-      tr.appendChild(favTd);
-
-      const providerTd = document.createElement('td');
-      providerTd.textContent = row.providerName;
-      tr.appendChild(providerTd);
-
-      const buyTd = document.createElement('td');
-      buyTd.textContent = formatNumber(row.buy);
-      tr.appendChild(buyTd);
-
-      const sellTd = document.createElement('td');
-      sellTd.textContent = formatNumber(row.sell);
-      tr.appendChild(sellTd);
-
-      const spreadTd = document.createElement('td');
-      spreadTd.textContent = formatNumber(row.spread);
-      tr.appendChild(spreadTd);
-
-      const changeTd = document.createElement('td');
-      changeTd.className = changeClass;
-      changeTd.textContent = formatPct(row.changePct);
-      tr.appendChild(changeTd);
-
-      const freshnessTd = document.createElement('td');
-      freshnessTd.className = `last-updated ${freshnessClass}`;
-      freshnessTd.title = formatShortDateTime(row.time);
-      const freshnessCell = document.createElement('div');
-      freshnessCell.className = 'freshness-cell';
-      const freshnessDot = document.createElement('span');
-      freshnessDot.className = 'freshness-dot';
-      freshnessCell.appendChild(freshnessDot);
-      const freshnessText = document.createElement('span');
-      freshnessText.className = 'freshness-text';
-      freshnessText.textContent = formatRelativeTime(row.time);
-      freshnessCell.appendChild(freshnessText);
-      freshnessTd.appendChild(freshnessCell);
-      tr.appendChild(freshnessTd);
-
-      body.appendChild(tr);
-    }
-  }
-
-  if (isLoggedIn) {
-    body.querySelectorAll('.fav-btn').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const pair = btn.dataset.pair;
-        const providerName = btn.dataset.provider;
-        const currentlyFav = favoriteSet.has(favoriteKey(pair, providerName));
-        btn.disabled = true;
-        try {
-          await updateFavorite(pair, providerName, !currentlyFav);
-          renderCurrencyList(rows);
-        } catch (error) {
-          console.error(error);
-          renderMeta(`Favori güncellenemedi: ${error.message}`);
-        } finally {
-          btn.disabled = false;
-        }
-      });
-    });
-  }
-}
-
-async function fetchJson(url) {
-  const res = await fetch(url, { cache: 'no-store' });
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-  return res.json();
-}
-
-async function fetchText(url) {
-  const res = await fetch(url, { cache: 'no-store' });
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-  return res.text();
-}
-
-async function fetchGzipText(url) {
-  const res = await fetch(url, { cache: 'no-store' });
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-
-  const buffer = await res.arrayBuffer();
-
-  if (!('DecompressionStream' in globalThis)) {
-    throw new Error('Tarayıcı gzip açmayı desteklemiyor.');
-  }
-
-  const ds = new DecompressionStream('gzip');
-  const decompressed = new Response(new Blob([buffer]).stream().pipeThrough(ds));
-  return decompressed.text();
-}
-
-function parseJsonl(text) {
-  return text
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => JSON.parse(line));
-}
-
-function renderMeta(message) {
-  const el = qs(SELECTORS.listMeta);
-  if (el) el.textContent = message;
-}
-
-function renderChartMeta(message, tone = 'info') {
-  const el = qs(SELECTORS.chartMeta);
-  if (!el) return;
-
-  el.textContent = message;
-  el.classList.remove('chart-meta--info', 'chart-meta--error');
-  if (message) {
-    el.classList.add(tone === 'error' ? 'chart-meta--error' : 'chart-meta--info');
-  }
-}
-
-function renderChartLegend(seriesList) {
-  const container = qs(SELECTORS.chartLegend);
-  if (!container) return;
-
-  container.textContent = '';
-  if (!seriesList.length) return;
-
-  for (const series of seriesList) {
-    const label = document.createElement('label');
-    label.className = 'chart-legend__item';
-    label.style.setProperty('--legend-color', series.color || '#1a56db');
-
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.className = 'chart-legend__checkbox';
-    checkbox.checked = chartVisibleSeriesIds.has(series.id);
-    checkbox.setAttribute('aria-label', `${series.name} serisini göster`);
-
-    checkbox.addEventListener('change', () => {
-      if (checkbox.checked) {
-        chartVisibleSeriesIds.add(series.id);
-      } else {
-        chartVisibleSeriesIds.delete(series.id);
-      }
-      chartHoverIndex = null;
-      renderChartMeta('');
-      drawRangeChart(chartLastSeries, chartLastPair);
-    });
-
-    const text = document.createElement('span');
-    text.className = 'chart-legend__text';
-    text.textContent = series.name || series.id || '-';
-
-    label.appendChild(checkbox);
-    label.appendChild(text);
-    container.appendChild(label);
-  }
-}
-
-function getVisibleChartSeries(seriesList) {
-  return seriesList.filter((series) => chartVisibleSeriesIds.has(series.id));
-}
-
-function createProviderMapFromSnapshot(snapshot) {
-  const map = new Map();
-  const results = Array.isArray(snapshot?.results) ? snapshot.results : [];
-  for (const result of results) {
-    const id = result?.meta?.id;
-    if (!id) continue;
-    map.set(id, result);
-  }
-  return map;
-}
-
-function applyCompactResultToMap(providerMap, result) {
-  const id = result?.meta?.id;
-  if (!id) return;
-
-  const prev = providerMap.get(id);
-
-  if (result?.data && typeof result.data === 'object') {
-    providerMap.set(id, {
-      ...prev,
-      ...result,
-      meta: result.meta || prev?.meta,
-      data: result.data,
-    });
-    return;
-  }
-
-  if (prev) {
-    providerMap.set(id, {
-      ...prev,
-      ...result,
-      meta: result.meta || prev.meta,
-      data: prev.data,
-    });
-    return;
-  }
-
-  providerMap.set(id, result);
-}
-
-function snapshotFromProviderMap(providerMap, template) {
-  return {
-    rev: template?.rev ?? 1,
-    scheduledFor: template?.scheduledFor ?? null,
-    runStartedAt: template?.runStartedAt ?? null,
-    timezone: template?.timezone ?? null,
-    results: Array.from(providerMap.values()),
-  };
-}
-
-function formatChartPointLabel(dateString, fallbackMonthKey) {
-  if (!dateString) return fallbackMonthKey;
-  const d = new Date(dateString);
-  if (Number.isNaN(d.getTime())) return fallbackMonthKey;
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-async function getLatestSnapshot() {
-  if (latestSnapshotCache && Array.isArray(latestSnapshotCache.results)) {
-    return latestSnapshotCache;
-  }
-
-  const latestUrl = `${DATA_BASE_URL}/latest_all.json`;
-  latestSnapshotCache = await fetchJson(latestUrl);
-  return latestSnapshotCache;
-}
-
-async function getCurrentMonthlyEntries() {
-  if (Array.isArray(currentMonthlyEntriesCache)) {
-    return currentMonthlyEntriesCache;
-  }
-
-  let currentMonthlyPath = null;
-  try {
-    const indexJson = await fetchJson(`${DATA_BASE_URL}/index.json`);
-    if (indexJson?.currentMonthly) {
-      currentMonthlyPath = `${DATA_BASE_URL}/${indexJson.currentMonthly}`;
-    }
-  } catch {
-    currentMonthlyPath = null;
-  }
-
-  if (!currentMonthlyPath) {
-    const now = new Date();
-    const monthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-    currentMonthlyPath = `${DATA_BASE_URL}/monthlies/current/${monthKey}.jsonl`;
-  }
-
-  const text = await fetchText(currentMonthlyPath);
-  currentMonthlyEntriesCache = parseJsonl(text);
-  return currentMonthlyEntriesCache;
-}
-
-function toDateOnlyString(dateValue) {
-  if (typeof dateValue === 'string') {
-    const isoDateMatch = dateValue.match(/^(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01]))(?:$|T)/);
-    if (isoDateMatch) return isoDateMatch[1];
-  }
-  const d = new Date(dateValue);
-  if (Number.isNaN(d.getTime())) return null;
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
-}
-
-function getAvailableDateBounds(entries) {
-  const points = [];
-  for (const entry of entries || []) {
-    const iso = entry?.runStartedAt || entry?.scheduledFor;
-    const dateOnly = toDateOnlyString(iso);
-    if (dateOnly) points.push(dateOnly);
-  }
-  if (!points.length) return null;
-  points.sort();
-  return {
-    minDate: points[0],
-    maxDate: points[points.length - 1],
-  };
-}
-
-function addDays(dateOnly, days) {
-  const parts = typeof dateOnly === 'string' ? dateOnly.split('-') : [];
-  if (parts.length !== 3) return null;
-  const year = Number(parts[0]);
-  const month = Number(parts[1]);
-  const day = Number(parts[2]);
-  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return null;
-  const d = new Date(Date.UTC(year, month - 1, day));
-  if (Number.isNaN(d.getTime())) return null;
-  d.setUTCDate(d.getUTCDate() + days);
-  return toDateOnlyString(d.toISOString());
-}
-
-async function applyDateInputBounds() {
-  const rangeStartInput = qs(SELECTORS.rangeStartInput);
-  const rangeEndInput = qs(SELECTORS.rangeEndInput);
-  if (!rangeStartInput || !rangeEndInput) return;
-
-  try {
-    const entries = await getCurrentMonthlyEntries();
-    const bounds = getAvailableDateBounds(entries);
-    if (!bounds) return;
-
-    const { minDate, maxDate } = bounds;
-    rangeStartInput.min = minDate;
-    rangeStartInput.max = maxDate;
-    rangeEndInput.min = minDate;
-    rangeEndInput.max = maxDate;
-
-    const desiredStart = addDays(maxDate, -7);
-    const safeStart = desiredStart && desiredStart >= minDate ? desiredStart : minDate;
-
-    if (!rangeStartInput.value || rangeStartInput.value < minDate || rangeStartInput.value > maxDate) {
-      rangeStartInput.value = safeStart;
-    }
-    if (!rangeEndInput.value || rangeEndInput.value < minDate || rangeEndInput.value > maxDate) {
-      rangeEndInput.value = maxDate;
-    }
-
-    if (rangeStartInput.value > rangeEndInput.value) {
-      rangeStartInput.value = rangeEndInput.value;
-    }
-  } catch (error) {
-    console.warn('[homeDataLoader] date input bounds could not be applied', error?.message || error);
-  }
-}
-
-function monthKeyToIndex(monthKey) {
-  if (!/^\d{4}-\d{2}$/.test(monthKey)) return null;
-  const [yearText, monthText] = monthKey.split('-');
-  const year = Number(yearText);
-  const month = Number(monthText);
-  if (!Number.isInteger(year) || !Number.isInteger(month)) return null;
-  if (month < 1 || month > 12) return null;
-  return year * 12 + (month - 1);
-}
-
-function indexToMonthKey(index) {
-  const year = Math.floor(index / 12);
-  const month = (index % 12) + 1;
-  return `${year}-${String(month).padStart(2, '0')}`;
-}
-
-function enumerateMonthKeys(startMonthKey, endMonthKey) {
-  const startIndex = monthKeyToIndex(startMonthKey);
-  const endIndex = monthKeyToIndex(endMonthKey);
-  if (startIndex == null || endIndex == null || startIndex > endIndex) return [];
-  const keys = [];
-  for (let i = startIndex; i <= endIndex; i += 1) {
-    keys.push(indexToMonthKey(i));
-  }
-  return keys;
-}
-
-async function fetchMonthlyEntries(monthKey) {
-  let jsonlText = '';
-  const currentPath = `${DATA_BASE_URL}/monthlies/current/${monthKey}.jsonl`;
-
-  try {
-    jsonlText = await fetchText(currentPath);
-  } catch {
-    const [year, month] = monthKey.split('-');
-    const closedPath = `${DATA_BASE_URL}/monthlies/${year}/${month}.jsonl.gz`;
-    jsonlText = await fetchGzipText(closedPath);
-  }
-
-  return parseJsonl(jsonlText);
-}
-
-function getPairParity(rows, pair) {
-  const matches = rows.filter((r) => r.pair === pair).map((r) => r.parity).filter(Number.isFinite);
-  if (!matches.length) return null;
-  return matches.reduce((a, b) => a + b, 0) / matches.length;
-}
-
-function ensureChartHoverEvents(canvas) {
-  if (!canvas || canvas.dataset.hoverBound === '1') return;
-
-  canvas.addEventListener('mousemove', (event) => {
-    if (!chartPointPixels.length) return;
-
-    const rect = canvas.getBoundingClientRect();
-    const mx = event.clientX - rect.left;
-    const my = event.clientY - rect.top;
-
-    let nearest = null;
-    let nearestDist = Infinity;
-
-    chartPointPixels.forEach((p, i) => {
-      const dx = mx - p.x;
-      const dy = my - p.y;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      if (dist < nearestDist) {
-        nearestDist = dist;
-        nearest = i;
-      }
-    });
-
-    const nextHover = nearestDist <= 12 ? nearest : null;
-    canvas.style.cursor = nextHover != null ? 'pointer' : 'default';
-
-    if (nextHover !== chartHoverIndex) {
-      chartHoverIndex = nextHover;
-      drawRangeChart(chartLastSeries, chartLastPair);
-    }
-  });
-
-  canvas.addEventListener('mouseleave', () => {
-    if (chartHoverIndex != null) {
-      chartHoverIndex = null;
-      drawRangeChart(chartLastSeries, chartLastPair);
-    }
-    canvas.style.cursor = 'default';
-  });
-
-  canvas.dataset.hoverBound = '1';
-}
-
-function drawRangeChart(seriesArg, pair) {
-  const canvas = qs(SELECTORS.chartCanvas);
-  if (!canvas || typeof canvas.getContext !== 'function') return;
-
-  // Normalize input to { id, name, color, data[] } series list.
-  let seriesList = [];
-  if (!seriesArg) {
-    seriesList = [];
-  } else if (
-    Array.isArray(seriesArg) &&
-    seriesArg[0] &&
-    Object.prototype.hasOwnProperty.call(seriesArg[0], 'data')
-  ) {
-    seriesList = seriesArg.map((s) => ({
-      id: s.id || s.name,
-      name: s.name || s.id,
-      color: s.color || null,
-      data: Array.isArray(s.data) ? s.data : [],
-    }));
-  } else if (
-    Array.isArray(seriesArg) &&
-    seriesArg[0] &&
-    Object.prototype.hasOwnProperty.call(seriesArg[0], 'value')
-  ) {
-    seriesList = [{
-      id: 'avg',
-      name: pair,
-      color: '#1a56db',
-      data: seriesArg.map((p) => ({ label: p.label, value: p.value })),
-    }];
-  }
-
-  chartLastSeries = seriesList.slice();
-  chartLastPair = pair;
-
-  if (chartVisibleSeriesIds.size > 0 && !chartLastSeries.some((series) => chartVisibleSeriesIds.has(series.id))) {
-    chartVisibleSeriesIds = new Set(chartLastSeries.map((series) => series.id));
-  }
-
-  ensureChartHoverEvents(canvas);
-  const nextLegendSignature = chartLastSeries
-    .map((series) => `${series.id}:${chartVisibleSeriesIds.has(series.id) ? '1' : '0'}`)
-    .join('|');
-  if (nextLegendSignature !== chartLegendSignature) {
-    renderChartLegend(chartLastSeries);
-    chartLegendSignature = nextLegendSignature;
-  }
-
-  const visibleSeriesList = getVisibleChartSeries(chartLastSeries);
-
-  const dpr = globalThis.devicePixelRatio || 1;
-  const cssWidth = canvas.clientWidth || 960;
-  const cssHeight = 280;
-  canvas.width = Math.floor(cssWidth * dpr);
-  canvas.height = Math.floor(cssHeight * dpr);
-
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, cssWidth, cssHeight);
-
-  if (!chartLastSeries.length || !chartLastSeries[0].data || chartLastSeries[0].data.length === 0) {
-    chartPointPixels = [];
-    ctx.fillStyle = '#6b7280';
-    ctx.font = '14px Segoe UI';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText('Seçilen aralıkta grafik verisi bulunamadı.', cssWidth / 2, cssHeight / 2);
-    
-    // Default değerlere geri al
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'alphabetic';
-    return 'no-data';
-  }
-
-  if (!visibleSeriesList.length) {
-    chartPointPixels = [];
-    renderChartMeta(CHART_EMPTY_SELECTION_MESSAGE, 'error');
-    return 'no-selection';
-  }
-
-  const padding = { top: 16, right: 24, bottom: 36, left: 56 };
-  const plotWidth = cssWidth - padding.left - padding.right;
-  const plotHeight = cssHeight - padding.top - padding.bottom;
-
-  const values = visibleSeriesList.flatMap((s) => s.data.map((p) => p.value)).filter(Number.isFinite);
-  if (values.length === 0) {
-    chartPointPixels = [];
-    ctx.fillStyle = '#6b7280';
-    ctx.font = '14px Segoe UI';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText('Seçilen aralıkta grafik verisi bulunamadı.', cssWidth / 2, cssHeight / 2);
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'alphabetic';
-    return 'no-data';
-  }
-  const rawMin = Math.min(...values);
-  const rawMax = Math.max(...values);
-  const rawRange = rawMax - rawMin || 1;
-  const min = rawMin - rawRange * 0.08;
-  const max = rawMax + rawRange * 0.08;
-  const range = max - min || 1;
-
-  const N = Math.max(1, visibleSeriesList[0].data.length);
-  const xFor = (i) => {
-    if (N === 1) return padding.left + plotWidth / 2;
-    return padding.left + (i / (N - 1)) * plotWidth;
-  };
-  const yFor = (v) => padding.top + ((max - v) / range) * plotHeight;
-
-  // chart area background
-  ctx.fillStyle = '#f8fbff';
-  ctx.fillRect(padding.left, padding.top, plotWidth, plotHeight);
-
-  ctx.strokeStyle = '#e5e7eb';
-  ctx.lineWidth = 1;
-  for (let i = 0; i <= 4; i += 1) {
-    const y = padding.top + (i / 4) * plotHeight;
-    ctx.beginPath();
-    ctx.moveTo(padding.left, y);
-    ctx.lineTo(cssWidth - padding.right, y);
-    ctx.stroke();
-
-    const val = max - (i / 4) * range;
-    ctx.fillStyle = '#6b7280';
-    ctx.font = '12px Segoe UI';
-    ctx.fillText(formatNumber(val, 2), 8, y + 4);
-  }
-
-  // axis baseline
-  ctx.strokeStyle = '#cbd5e1';
-  ctx.beginPath();
-  ctx.moveTo(padding.left, padding.top + plotHeight);
-  ctx.lineTo(cssWidth - padding.right, padding.top + plotHeight);
-  ctx.stroke();
-
-  const avgIndex = visibleSeriesList.findIndex((s) => s.id === 'avg');
-
-  // Draw average area if available.
-  if (avgIndex !== -1) {
-    const avgSeries = visibleSeriesList[avgIndex];
-    const gradient = ctx.createLinearGradient(0, padding.top, 0, padding.top + plotHeight);
-    gradient.addColorStop(0, 'rgba(26, 86, 219, 0.20)');
-    gradient.addColorStop(1, 'rgba(26, 86, 219, 0.02)');
-    ctx.fillStyle = gradient;
-    const baselineY = padding.top + plotHeight;
-    let firstX = null;
-    let lastX = null;
-    let started = false;
-    for (let i = 0; i < avgSeries.data.length; i += 1) {
-      const p = avgSeries.data[i];
-      if (!Number.isFinite(p.value)) {
-        if (started) {
-          ctx.lineTo(lastX, baselineY);
-          ctx.lineTo(firstX, baselineY);
-          ctx.closePath();
-          ctx.fill();
-          started = false;
-          firstX = null;
-          lastX = null;
-        }
-        continue;
-      }
-      const x = xFor(i);
-      const y = yFor(p.value);
-      if (!started) {
-        ctx.beginPath();
-        ctx.moveTo(x, baselineY);
-        ctx.lineTo(x, y);
-        firstX = x;
-        started = true;
-      } else {
-        ctx.lineTo(x, y);
-      }
-      lastX = x;
-    }
-    if (started) {
-      ctx.lineTo(lastX, baselineY);
-      ctx.lineTo(firstX, baselineY);
-      ctx.closePath();
-      ctx.fill();
-    }
-  }
-
-  // Draw lines and points for each series.
-  chartPointPixels = [];
-  for (let si = 0; si < visibleSeriesList.length; si += 1) {
-    const s = visibleSeriesList[si];
-    const color = s.color || (si === avgIndex ? '#1a56db' : CHART_PALETTE[si % CHART_PALETTE.length]);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = si === avgIndex ? 2 : 1.5;
-
-    ctx.beginPath();
-    let started = false;
-    for (let i = 0; i < s.data.length; i += 1) {
-      const p = s.data[i];
-      if (!Number.isFinite(p.value)) {
-        started = false;
-        continue;
-      }
-      const x = xFor(i);
-      const y = yFor(p.value);
-      if (!started) {
-        ctx.moveTo(x, y);
-        started = true;
-      } else {
-        ctx.lineTo(x, y);
-      }
-    }
-    ctx.stroke();
-
-    ctx.fillStyle = color;
-    for (let i = 0; i < s.data.length; i += 1) {
-      const p = s.data[i];
-      if (!Number.isFinite(p.value)) continue;
-      const x = xFor(i);
-      const y = yFor(p.value);
-      chartPointPixels.push({ x, y, si, pi: i });
-      ctx.beginPath();
-      ctx.arc(x, y, 3.2, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-
-  if (chartHoverIndex != null && chartHoverIndex >= 0 && chartHoverIndex < chartPointPixels.length) {
-    const hp = chartPointPixels[chartHoverIndex];
-    const sv = visibleSeriesList[hp.si].data[hp.pi] || {};
-
-    // highlight hovered point
-    ctx.strokeStyle = '#1a56db';
-    ctx.lineWidth = 2;
-    ctx.fillStyle = '#ffffff';
-    ctx.beginPath();
-    ctx.arc(hp.x, hp.y, 5.5, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-
-    const tooltipLine1 = visibleSeriesList[hp.si].name || '-';
-    const tooltipLine2 = `${sv.label || '-'}: ${formatNumber(sv.value, 4)}`;
-    ctx.font = '12px Segoe UI';
-    const w = Math.max(ctx.measureText(tooltipLine1).width, ctx.measureText(tooltipLine2).width) + 16;
-    const h = 38;
-    let tx = hp.x + 10;
-    let ty = hp.y - h - 10;
-    if (tx + w > cssWidth - 8) tx = hp.x - w - 10;
-    if (tx < 8) tx = 8;
-    if (ty < 8) ty = hp.y + 10;
-
-    ctx.fillStyle = 'rgba(17, 24, 39, 0.92)';
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    if (typeof ctx.roundRect === 'function') {
-      ctx.roundRect(tx, ty, w, h, 6);
-    } else {
-      ctx.rect(tx, ty, w, h);
-    }
-    ctx.fill();
-    ctx.stroke();
-
-    ctx.fillStyle = '#e5e7eb';
-    ctx.fillText(tooltipLine1, tx + 8, ty + 15);
-    ctx.fillStyle = '#ffffff';
-    ctx.fillText(tooltipLine2, tx + 8, ty + 30);
-  }
-
-  // Draw evenly spaced day labels (dd.mm) on x-axis.
-  const desiredTicks = Math.max(3, Math.min(7, Math.floor(plotWidth / 120)));
-  const tickIndexes = [];
-  if (N === 1) {
-    tickIndexes.push(0);
-  } else {
-    for (let t = 0; t < desiredTicks; t += 1) {
-      const idx = Math.round((t * (N - 1)) / (desiredTicks - 1));
-      if (tickIndexes[tickIndexes.length - 1] !== idx) tickIndexes.push(idx);
-    }
-  }
-
-  ctx.fillStyle = '#64748b';
-  ctx.font = '11px Segoe UI';
-  let lastDrawnLabel = '';
-
-  for (const pointIndex of tickIndexes) {
-    const point = visibleSeriesList[0].data[pointIndex];
-    const dayLabel = String(point?.label || '').split(' ')[0] || '';
-    if (!dayLabel) continue;
-
-    // Skip only exact duplicates to avoid repeated same-day text.
-    if (dayLabel === lastDrawnLabel && tickIndexes.length > 1) continue;
-
-    const x = xFor(pointIndex);
-
-    // small tick mark
-    ctx.strokeStyle = '#94a3b8';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(x, padding.top + plotHeight);
-    ctx.lineTo(x, padding.top + plotHeight + 4);
-    ctx.stroke();
-
-    const textWidth = ctx.measureText(dayLabel).width;
-    const minX = padding.left;
-    const maxX = cssWidth - padding.right - textWidth;
-    const textX = Math.min(Math.max(x - textWidth / 2, minX), maxX);
-    ctx.fillText(dayLabel, textX, cssHeight - 12);
-    lastDrawnLabel = dayLabel;
-  }
-
-  ctx.fillStyle = '#111827';
-  ctx.font = '600 13px Segoe UI';
-  ctx.fillText(`${pair} aralık grafiği`, padding.left, 14);
-
-  return 'ok';
-}
-
-async function loadRangeChart(startDateValue, endDateValue, pair, options = {}) {
-  const { silentFailure = false, manageLoading = true } = options;
-  const start = new Date(`${startDateValue}T00:00:00`);
-  const end = new Date(`${endDateValue}T23:59:59`);
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
-    if (!silentFailure) {
-      renderChartMeta('Aralık geçersiz. Başlangıç tarihi, bitiş tarihinden büyük olamaz.');
-    }
-    drawRangeChart([], pair);
-    return false;
-  }
-
-  if (manageLoading) {
-    showLoading(`${startDateValue} - ${endDateValue} günlük aralığı yükleniyor...`);
-  }
-  try {
-    const baseSnapshot = await getLatestSnapshot();
-    const providerMap = createProviderMapFromSnapshot(baseSnapshot);
-    const entries = await getCurrentMonthlyEntries();
-
-    // Collect snapshots within requested range (apply incremental provider updates).
-    const snapshots = [];
-    for (const entry of entries) {
-      const results = Array.isArray(entry?.results) ? entry.results : [];
-      for (const result of results) applyCompactResultToMap(providerMap, result);
-
-      const fullSnapshot = snapshotFromProviderMap(providerMap, entry);
-      const ts = new Date(entry?.runStartedAt || entry?.scheduledFor || '');
-      if (Number.isNaN(ts.getTime()) || ts < start || ts > end) continue;
-
-      const rows = filterVisibleRows(parseAllProviders(fullSnapshot));
-      snapshots.push({ ts, rows, snapshot: fullSnapshot });
-    }
-
-    if (!snapshots.length) {
-      drawRangeChart([], pair);
-      renderChartMeta('');
-      return false;
-    }
-
-    const labels = snapshots.map((s) => formatChartPointLabel(s.ts.toISOString(), startDateValue));
-
-    const avgSeries = {
-      id: 'avg',
-      name: 'Ortalama',
-      color: '#1a56db',
-      data: snapshots.map((s, i) => {
-        const v = getPairParity(s.rows, pair);
-        return { label: labels[i], value: Number.isFinite(v) ? v : null };
-      }),
-    };
-
-    const providerIdSet = new Set();
-    for (const s of snapshots) {
-      const results = Array.isArray(s.snapshot?.results) ? s.snapshot.results : [];
-      for (const r of results) {
-        const id = r?.meta?.id;
-        if (id) providerIdSet.add(id);
-      }
-    }
-    const providerIds = Array.from(providerIdSet);
-    const palette = ['#e11d48', '#059669', '#f59e0b', '#8b5cf6', '#06b6d4'];
-
-    const providerSeries = providerIds.map((pid, idx) => {
-      let name = pid;
-      for (const s of snapshots) {
-        const found = (s.snapshot?.results || []).find((r) => r?.meta?.id === pid);
-        if (found) {
-          name = found.meta?.name || pid;
-          break;
-        }
-      }
-      return {
-        id: pid,
-        name,
-        color: palette[idx % palette.length],
-        data: [],
-      };
-    });
-
-    for (let i = 0; i < snapshots.length; i += 1) {
-      const s = snapshots[i];
-      const rowsByProvider = new Map();
-      for (const r of (s.rows || [])) {
-        const bucket = rowsByProvider.get(r.providerId);
-        if (bucket) {
-          bucket.push(r);
-        } else {
-          rowsByProvider.set(r.providerId, [r]);
-        }
-      }
-      for (const ps of providerSeries) {
-        const provRows = rowsByProvider.get(ps.id) || [];
-        const v = getPairParity(provRows, pair);
-        ps.data.push({ label: labels[i], value: Number.isFinite(v) ? v : null });
-      }
-    }
-
-    const seriesList = [avgSeries, ...providerSeries];
-    chartVisibleSeriesIds = new Set(seriesList.map((series) => series.id));
-    const chartStatus = drawRangeChart(seriesList, pair);
-    if (chartStatus === 'ok' || chartStatus === 'no-data') {
-      renderChartMeta('');
-    }
-    return chartStatus === 'ok' || chartStatus === 'no-data';
-  } catch (error) {
-    console.error(error);
-    if (!silentFailure) {
-      renderChartMeta(`Grafik yüklenemedi: ${error.message}`);
-    }
-    return false;
-  } finally {
-    if (manageLoading) {
-      hideLoading();
-    }
-  }
-}
-
-async function loadChartFromInputs() {
-  const startInput = qs(SELECTORS.rangeStartInput);
-  const endInput = qs(SELECTORS.rangeEndInput);
-  const startDay = startInput?.value || '';
-  const endDay = endInput?.value || '';
-  const pair = qs(SELECTORS.chartPair)?.value || 'USD/TRY';
-
-  if (!startDay || !endDay) {
-    renderChartMeta('Lütfen başlangıç ve bitiş tarihini seçin.');
-    return false;
-  }
-
-  return loadRangeChart(startDay, endDay, pair);
-}
-
-async function loadChartFromInputsWithRetry(maxAttempts = 3) {
-  let attempt = 0;
-  const startDay = qs(SELECTORS.rangeStartInput)?.value || '';
-  const endDay = qs(SELECTORS.rangeEndInput)?.value || '';
-  showLoading(`${startDay} - ${endDay} günlük aralığı yükleniyor...`);
-  
-  try {
-    while (attempt < maxAttempts) {
-      const ok = await loadRangeChart(
-        qs(SELECTORS.rangeStartInput)?.value || '',
-        qs(SELECTORS.rangeEndInput)?.value || '',
-        qs(SELECTORS.chartPair)?.value || 'USD/TRY',
-        { silentFailure: attempt < maxAttempts - 1, manageLoading: false }
-      );
-      if (ok) return true;
-      attempt += 1;
-      if (attempt < maxAttempts) {
-        await sleep(250 * attempt);
-      }
-    }
-    return false;
-  } finally {
-    hideLoading();
-  }
-}
-
-export async function loadLatestData() {
-  showLoading('Son veriler yükleniyor...');
-  try {
-    const latestUrl = `${DATA_BASE_URL}/latest_all.json`;
-    const latest = await fetchJson(latestUrl);
-    latestSnapshotCache = latest;
-    let rows = [];
-    let effectiveLast = latest?.runStartedAt || null;
-    try {
-      const providerMap = createProviderMapFromSnapshot(latest);
-      let lastEntryTs = null;
-
+function bindFavoriteButtons() {
+  if (!isLoggedIn) return;
+
+  qs(SELECTORS.listBody)?.querySelectorAll('.fav-btn').forEach((button) => {
+    if (button.dataset.favoriteBound === '1') return;
+    button.dataset.favoriteBound = '1';
+
+    button.addEventListener('click', async () => {
+      const pair = button.dataset.pair || '';
+      const providerName = button.dataset.provider || '';
+      const key = favoriteKey(pair, providerName);
+      const shouldAdd = !favoriteSet.has(key);
+
+      button.disabled = true;
       try {
-        const entries = await getCurrentMonthlyEntries();
-        if (Array.isArray(entries) && entries.length) {
-          for (const entry of entries) {
-            const results = Array.isArray(entry?.results) ? entry.results : [];
-            for (const result of results) {
-              applyCompactResultToMap(providerMap, result);
-            }
-          }
-          const lastEntry = entries[entries.length - 1];
-          lastEntryTs = lastEntry?.runStartedAt || lastEntry?.scheduledFor || null;
-        }
-      } catch (errEntries) {
-        console.warn('[homeDataLoader] monthlies could not be applied for list', errEntries?.message || errEntries);
+        await updateFavorite(pair, providerName, shouldAdd);
+        renderCurrencyList(latestLoadedRows);
+      } catch (error) {
+        console.error('[homeDataLoader] favori güncellenemedi', error);
+        renderListMeta(`Favori güncellenemedi: ${error?.message || error}`, true);
+      } finally {
+        button.disabled = false;
       }
-
-      const fullSnapshot = snapshotFromProviderMap(providerMap, latest);
-      rows = filterVisibleRows(parseAllProviders(fullSnapshot));
-      if (lastEntryTs) effectiveLast = lastEntryTs;
-    } catch (e) {
-      console.error('[homeDataLoader] could not build merged rows for list', e);
-      try {
-        rows = filterVisibleRows(parseAllProviders(latest));
-      } catch (ee) {
-        rows = [];
-      }
-    }
-
-    latestLoadedRows = rows.slice();
-    updateSummaryCards(rows);
-    renderCurrencyList(rows);
-
-    renderMeta(`Son güncelleme: ${formatShortDateTime(effectiveLast)}`);
-  } catch (error) {
-    console.error(error);
-    renderMeta(`Son veriler yüklenemedi: ${error.message}`);
-  } finally {
-    hideLoading();
-  }
+    });
+  });
 }
 
-export async function loadMonthlyData(monthKey) {
-  if (!/^\d{4}-\d{2}$/.test(monthKey)) {
-    renderMeta('Ay formatı geçersiz. Örnek: 2026-04');
-    return;
-  }
+async function loadLatestData({ showOverlay = false } = {}) {
+  if (latestLoadPromise) return latestLoadPromise;
 
-  showLoading(`${monthKey} ayı yükleniyor...`);
-  try {
-    let jsonlText = '';
-    const currentPath = `${DATA_BASE_URL}/monthlies/current/${monthKey}.jsonl`;
+  latestLoadPromise = (async () => {
+    if (showOverlay) showLoading('Son veriler yükleniyor...');
 
     try {
-      jsonlText = await fetchText(currentPath);
-    } catch {
-      const [year, month] = monthKey.split('-');
-      const closedPath = `${DATA_BASE_URL}/monthlies/${year}/${month}.jsonl.gz`;
-      jsonlText = await fetchGzipText(closedPath);
+      const snapshot = await fetchJson(latestDataUrl());
+      const rows = filterVisibleRows(parseAllProviders(snapshot));
+
+      if (!rows.length) {
+        throw new Error('Kur sağlayıcılarından kullanılabilir veri gelmedi.');
+      }
+
+      latestRunStartedAt = snapshot?.runStartedAt || snapshot?.scheduledFor || null;
+      latestLoadedRows = rows;
+      lastSuccessfulLoadAt = Date.now();
+
+      updateSummaryCards(rows);
+      renderCurrencyList(rows);
+      updateSortIndicator();
+      renderListMeta(`Son güncelleme: ${formatShortDateTime(latestRunStartedAt)}`);
+    } catch (error) {
+      console.error('[homeDataLoader]', error);
+      const prefix = latestLoadedRows.length ? 'Yeni veri alınamadı' : 'Son veriler yüklenemedi';
+      renderListMeta(`${prefix}: ${error?.message || error}`, true);
+    } finally {
+      if (showOverlay) hideLoading();
+      latestLoadPromise = null;
     }
+  })();
 
-    const entries = parseJsonl(jsonlText);
-    if (!entries.length) {
-      renderMeta(`${monthKey} için veri bulunamadı.`);
-      renderCurrencyList([]);
-      return;
-    }
-
-    const latestEntry = entries[entries.length - 1];
-    const rows = filterVisibleRows(parseAllProviders(latestEntry));
-
-    latestLoadedRows = rows.slice();
-    updateSummaryCards(rows);
-    renderCurrencyList(rows);
-    renderMeta(`${monthKey} yüklendi | Snapshot sayısı: ${entries.length} | Son run: ${latestEntry.runStartedAt || '-'}`);
-  } catch (error) {
-    console.error(error);
-    renderMeta(`${monthKey} yüklenemedi: ${error.message}`);
-  } finally {
-    hideLoading();
-  }
-}
-
-function wireRangeLoader() {
-  const button = qs(SELECTORS.rangeButton);
-  if (!button) return;
-
-  button.addEventListener('click', () => {
-    const startInput = qs(SELECTORS.rangeStartInput);
-    const endInput = qs(SELECTORS.rangeEndInput);
-    const startDay = startInput?.value || '';
-    const endDay = endInput?.value || '';
-    if (!startDay || !endDay) {
-      renderChartMeta('Lütfen başlangıç ve bitiş tarihini seçin.');
-      return;
-    }
-
-    const minDay = startInput?.min || endInput?.min || '';
-    const maxDay = startInput?.max || endInput?.max || '';
-    if (minDay && (startDay < minDay || endDay < minDay)) {
-      renderChartMeta(`Bu kaynakta en eski tarih ${minDay}. Daha önceki günler seçilemez.`);
-      return;
-    }
-    if (maxDay && (startDay > maxDay || endDay > maxDay)) {
-      renderChartMeta(`Bu kaynakta en yeni tarih ${maxDay}. Daha sonrası seçilemez.`);
-      return;
-    }
-
-    void loadChartFromInputs();
-  });
+  return latestLoadPromise;
 }
 
 function setCurrentYear() {
-  const el = document.getElementById('year');
-  const now = new Date();
-  if (el) el.textContent = now.getFullYear();
+  const year = document.getElementById('year');
+  if (year) year.textContent = String(new Date().getFullYear());
+}
 
-  const pad = (n) => String(n).padStart(2, '0');
-  const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-  const prevDate = new Date(now);
-  prevDate.setDate(now.getDate() - 7);
-  const weekAgo = `${prevDate.getFullYear()}-${pad(prevDate.getMonth() + 1)}-${pad(prevDate.getDate())}`;
+async function refreshAuthAndFavorites() {
+  await initAuthState();
+  await loadFavorites();
+  if (latestLoadedRows.length) renderCurrencyList(latestLoadedRows);
+}
 
-  const rangeStartInput = qs(SELECTORS.rangeStartInput);
-  const rangeEndInput = qs(SELECTORS.rangeEndInput);
-  if (rangeStartInput && !rangeStartInput.value) {
-    rangeStartInput.value = weekAgo;
-  }
-  if (rangeEndInput && !rangeEndInput.value) {
-    rangeEndInput.value = today;
-  }
+function bindLifecycleRefresh() {
+  window.setInterval(() => {
+    void loadLatestData({ showOverlay: false });
+  }, 10 * 60 * 1000);
+
+  window.setInterval(refreshRelativeTimes, 60 * 1000);
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+
+    refreshRelativeTimes();
+
+    if (Date.now() - lastSuccessfulLoadAt > 3 * 60 * 1000) {
+      void loadLatestData({ showOverlay: false });
+    }
+  });
+
+  window.addEventListener('pageshow', (event) => {
+    if (event.persisted) {
+      void refreshAuthAndFavorites();
+      void loadLatestData({ showOverlay: false });
+    }
+  });
 }
 
 async function init() {
-  showLoading('Sayfa hazırlanıyor...');
-  try {
-    if (typeof setCurrentYear === 'function') setCurrentYear();
-    const boundsPromise = applyDateInputBounds();
-    if (typeof wireSortHeaders === 'function') wireSortHeaders();
-    if (typeof wireRangeLoader === 'function') wireRangeLoader();
-    drawRangeChart([], 'USD/TRY');
-    renderChartMeta('');
-    if (typeof initAuthState === 'function') {
-      const doLoadFavs = typeof loadFavorites === 'function' ? loadFavorites : () => {};
-      initAuthState()
-        .then(doLoadFavs)
-        .then(() => {
-          if (latestLoadedRows.length > 0) {
-            renderCurrencyList(latestLoadedRows);
-            updateSortIndicator();
-          }
-        })
-        .catch((error) => {
-          console.warn('[homeDataLoader] auth state could not be initialized', error?.message || error);
-        });
-    }
+  setCurrentYear();
+  wireSortHeaders();
 
-    const latestPromise = typeof loadLatestData === 'function' ? loadLatestData() : Promise.resolve();
-    const chartPromise = (async () => {
-      await boundsPromise.catch((error) => {
-        console.warn('[homeDataLoader] date bounds could not be applied', error?.message || error);
-      });
-      await loadChartFromInputsWithRetry(3);
-    })();
+  await Promise.allSettled([
+    refreshAuthAndFavorites(),
+    loadLatestData({ showOverlay: true })
+  ]);
 
-    await Promise.allSettled([latestPromise, chartPromise, boundsPromise]);
-
-    // safety: if nothing loaded shortly after init, try loading latest again
-    setTimeout(() => {
-      if ((!latestLoadedRows || latestLoadedRows.length === 0) && typeof loadLatestData === 'function') {
-        console.warn('[homeDataLoader] no rows after init — retrying loadLatestData');
-        loadLatestData();
-      }
-    }, 1200);
-  } finally {
-    hideLoading();
-  }
+  bindLifecycleRefresh();
 }
 
 if (typeof document !== 'undefined') {
   document.addEventListener('DOMContentLoaded', () => {
     void init();
-    window.addEventListener('pageshow', (event) => {
-      if (event.persisted) {
-        void refreshFavoritesOnResume();
-      }
-    });
   });
 }
