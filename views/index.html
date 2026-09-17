@@ -5,73 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Kur Takip – Ana Sayfa</title>
   <link rel="stylesheet" href="/style.css" />
-  <style>
-    .chart-wrap {
-      position: relative;
-      overflow: visible;
-    }
-
-    #range-chart {
-      cursor: crosshair;
-      image-rendering: auto;
-    }
-
-    .chart-legend__dot,
-    .chart-tooltip__dot {
-      display: inline-block;
-      flex: 0 0 auto;
-      width: 10px;
-      height: 10px;
-      border-radius: 999px;
-    }
-
-    .chart-tooltip {
-      position: absolute;
-      z-index: 20;
-      min-width: 190px;
-      padding: 10px 12px;
-      border: 1px solid #dbe3ef;
-      border-radius: 10px;
-      background: rgba(17, 24, 39, .96);
-      color: #fff;
-      box-shadow: 0 10px 28px rgba(15, 23, 42, .22);
-      pointer-events: none;
-      font-size: 13px;
-      line-height: 1.35;
-      backdrop-filter: blur(4px);
-    }
-
-    .chart-tooltip.hidden {
-      display: none;
-    }
-
-    .chart-tooltip__date {
-      margin-bottom: 8px;
-      padding-bottom: 7px;
-      border-bottom: 1px solid rgba(255,255,255,.16);
-      font-weight: 700;
-    }
-
-    .chart-tooltip__row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      margin-top: 6px;
-    }
-
-    .chart-tooltip__bank {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      white-space: nowrap;
-    }
-
-    .chart-tooltip__value {
-      white-space: nowrap;
-      font-variant-numeric: tabular-nums;
-    }
-  </style>
 </head>
 <body>
 
@@ -79,13 +12,11 @@
 
   <main class="page">
 
-    <!-- Hero -->
     <section class="hero">
       <h1 class="hero__title">Döviz Kurlarını Takip Edin</h1>
       <p class="hero__sub">Güncel döviz kurlarını, grafikleri ve favori paritelerinizi tek ekranda görüntüleyin.</p>
     </section>
 
-    <!-- Summary cards (populated by future issues) -->
     <div class="summary-grid">
       <div class="summary-card">
         <span class="summary-card__label">USD/TRY</span>
@@ -109,10 +40,8 @@
       </div>
     </div>
 
-    <!-- Main content grid -->
     <div class="home-grid">
 
-      <!-- Chart placeholder -->
       <div class="card">
         <div class="section-header">
           <h3>Kur Grafiği</h3>
@@ -130,18 +59,27 @@
             <button id="range-load-btn" class="btn btn-primary btn-sm" type="button">Grafiği Yükle</button>
           </div>
         </div>
+
+        <div id="chart-meta" class="chart-meta" aria-live="polite"></div>
         <div id="chart-legend" class="chart-legend mt-3" role="group" aria-label="Grafik serileri"></div>
-        <div class="chart-wrap mt-3">
-          <canvas id="range-chart" width="960" height="320" aria-label="Kur aralık grafiği"></canvas>
+
+        <div class="chart-wrap mt-3" aria-busy="false">
+          <canvas
+            id="range-chart"
+            width="960"
+            height="360"
+            aria-label="Banka geçmiş kur grafiği"
+          ></canvas>
         </div>
       </div>
 
-      <!-- Currency list placeholder -->
       <div class="card">
         <div class="section-header">
           <h3>Kur Listesi</h3>
         </div>
-        <div id="currency-list-meta" class="text-muted mt-2"></div>
+
+        <div id="currency-list-meta" class="text-muted mt-2" aria-live="polite"></div>
+
         <div class="currency-table-wrap mt-3">
           <table class="currency-table">
             <thead>
@@ -176,7 +114,6 @@
 
   <script type="module" src="/homeDataLoader.js"></script>
   <script type="module" src="/historyDataLoader.js"></script>
-  <script type="module" src="/historyRangeControls.js"></script>
 
 </body>
 </html>
