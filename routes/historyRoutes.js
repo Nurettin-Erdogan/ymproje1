@@ -7,7 +7,8 @@ const SUPPORTED_PAIRS = new Set(['USD/TRY', 'EUR/TRY', 'GBP/TRY', 'XAU/TRY']);
 const GRAMS_PER_TROY_OUNCE = 31.1034768;
 const MAX_HISTORY_YEARS = 10;
 const HISTORY_CHUNK_DAYS = 365;
-const MAX_CACHE_ENTRIES = 120;
+const MAX_CACHE_ENTRIES = 40;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 const referenceCache = new Map();
 const bankCache = new Map();
@@ -41,8 +42,7 @@ function parseDateOnly(value) {
   if (!DATE_RE.test(value || '')) return null;
   const date = new Date(`${value}T00:00:00Z`);
   if (Number.isNaN(date.getTime())) return null;
-  if (toDateOnly(date) !== value) return null;
-  return date;
+  return toDateOnly(date) === value ? date : null;
 }
 
 function todayInIstanbul() {
@@ -59,6 +59,7 @@ function todayInIstanbul() {
 
 function oldestAllowedDate() {
   const today = parseDateOnly(todayInIstanbul());
+  if (!today) return null;
   const oldest = new Date(today);
   oldest.setUTCFullYear(oldest.getUTCFullYear() - MAX_HISTORY_YEARS);
   return oldest;
@@ -68,18 +69,11 @@ function validateRange(start, end, pair) {
   const startDate = parseDateOnly(start);
   const endDate = parseDateOnly(end);
 
-  if (!startDate || !endDate || startDate > endDate) {
-    return 'Geçersiz tarih aralığı.';
-  }
-
-  if (!SUPPORTED_PAIRS.has(pair)) {
-    return 'Desteklenmeyen parite.';
-  }
+  if (!startDate || !endDate || startDate > endDate) return 'Geçersiz tarih aralığı.';
+  if (!SUPPORTED_PAIRS.has(pair)) return 'Desteklenmeyen parite.';
 
   const today = parseDateOnly(todayInIstanbul());
-  if (today && endDate > today) {
-    return 'Gelecek tarih için geçmiş veri sorgulanamaz.';
-  }
+  if (today && endDate > today) return 'Gelecek tarih için geçmiş veri sorgulanamaz.';
 
   const oldest = oldestAllowedDate();
   if (oldest && startDate < oldest) {
@@ -99,7 +93,7 @@ function rangeDays(start, end) {
   const startDate = parseDateOnly(start);
   const endDate = parseDateOnly(end);
   if (!startDate || !endDate) return 1;
-  return Math.max(1, Math.floor((endDate - startDate) / 86400000) + 1);
+  return Math.max(1, Math.floor((endDate - startDate) / DAY_MS) + 1);
 }
 
 function timeoutForRange(start, end) {
@@ -111,9 +105,7 @@ function timeoutForRange(start, end) {
 }
 
 function cacheTtlMs(end) {
-  return end >= todayInIstanbul()
-    ? 5 * 60 * 1000
-    : 6 * 60 * 60 * 1000;
+  return end >= todayInIstanbul() ? 5 * 60 * 1000 : 6 * 60 * 60 * 1000;
 }
 
 function getCached(cache, key) {
@@ -125,42 +117,36 @@ function getCached(cache, key) {
     return null;
   }
 
+  // Refresh insertion order so eviction behaves like a tiny LRU.
+  cache.delete(key);
+  cache.set(key, entry);
   return entry.value;
 }
 
 function setCached(cache, key, value, ttlMs) {
-  if (cache.size >= MAX_CACHE_ENTRIES) {
+  if (cache.has(key)) cache.delete(key);
+  while (cache.size >= MAX_CACHE_ENTRIES) {
     const oldestKey = cache.keys().next().value;
-    if (oldestKey !== undefined) cache.delete(oldestKey);
+    if (oldestKey === undefined) break;
+    cache.delete(oldestKey);
   }
 
-  cache.set(key, {
-    value,
-    expiresAt: Date.now() + ttlMs
-  });
+  cache.set(key, { value, expiresAt: Date.now() + ttlMs });
 }
 
 function splitDateRange(start, end, maxDays = HISTORY_CHUNK_DAYS) {
   const chunks = [];
   let cursor = parseDateOnly(start);
   const finalDate = parseDateOnly(end);
-
-  if (!cursor || !finalDate) return chunks;
+  if (!cursor || !finalDate || cursor > finalDate) return chunks;
 
   while (cursor <= finalDate) {
     const chunkStart = new Date(cursor);
     const chunkEnd = new Date(cursor);
     chunkEnd.setUTCDate(chunkEnd.getUTCDate() + maxDays - 1);
+    if (chunkEnd > finalDate) chunkEnd.setTime(finalDate.getTime());
 
-    if (chunkEnd > finalDate) {
-      chunkEnd.setTime(finalDate.getTime());
-    }
-
-    chunks.push({
-      start: toDateOnly(chunkStart),
-      end: toDateOnly(chunkEnd)
-    });
-
+    chunks.push({ start: toDateOnly(chunkStart), end: toDateOnly(chunkEnd) });
     cursor = new Date(chunkEnd);
     cursor.setUTCDate(cursor.getUTCDate() + 1);
   }
@@ -181,7 +167,6 @@ function timestampToIstanbulDate(timestampSeconds) {
 
   const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
   if (!values.year || !values.month || !values.day) return null;
-
   return `${values.year}-${values.month}-${values.day}`;
 }
 
@@ -189,7 +174,6 @@ function parseCanliDovizHistory(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return [];
 
   const byDate = new Map();
-
   for (const [timestampText, ohlcText] of Object.entries(payload)) {
     const timestamp = Number(timestampText);
     if (!Number.isFinite(timestamp) || typeof ohlcText !== 'string') continue;
@@ -213,19 +197,19 @@ function parseCanliDovizHistory(payload) {
   return Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
 }
 
-function dedupePoints(points) {
+function dedupePoints(points, start, end) {
   const byDate = new Map();
-
   for (const point of points) {
     if (!DATE_RE.test(point?.date || '') || !Number.isFinite(Number(point?.value))) continue;
+    if (start && point.date < start) continue;
+    if (end && point.date > end) continue;
     byDate.set(point.date, point);
   }
-
   return Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
 }
 
-async function wait(ms) {
-  await new Promise((resolve) => setTimeout(resolve, ms));
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function fetchCanliDovizChunk(itemId, start, end, signal) {
@@ -235,11 +219,7 @@ async function fetchCanliDovizChunk(itemId, start, end, signal) {
   url.searchParams.set('startDate', `${start}T00:00:00`);
   url.searchParams.set('endDate', `${end}T23:59:59`);
 
-  const response = await fetch(url, {
-    headers: CANLIDOVIZ_HEADERS,
-    signal
-  });
-
+  const response = await fetch(url, { headers: CANLIDOVIZ_HEADERS, signal });
   if (!response.ok) {
     const details = (await response.text()).slice(0, 200);
     throw new Error(`HTTP ${response.status}${details ? ` - ${details}` : ''}`);
@@ -257,10 +237,7 @@ async function fetchCanliDovizChunkWithRetry(itemId, start, end, signal) {
     } catch (error) {
       if (error?.name === 'AbortError') throw error;
       lastError = error;
-
-      if (attempt === 0) {
-        await wait(350);
-      }
+      if (attempt === 0) await wait(350);
     }
   }
 
@@ -270,69 +247,41 @@ async function fetchCanliDovizChunkWithRetry(itemId, start, end, signal) {
 async function fetchBankSeries(bank, pair, start, end, signal) {
   const itemId = BANK_ITEM_IDS[pair]?.[bank.id];
   if (!itemId) {
-    return {
-      id: bank.id,
-      name: bank.name,
-      points: [],
-      error: 'Bu parite için tarihsel seri yok.'
-    };
+    return { id: bank.id, name: bank.name, points: [], error: 'Bu parite için tarihsel seri yok.' };
   }
 
-  const chunks = splitDateRange(start, end);
   const allPoints = [];
   const failedChunks = [];
 
-  for (const chunk of chunks) {
+  for (const chunk of splitDateRange(start, end)) {
     try {
-      const points = await fetchCanliDovizChunkWithRetry(
-        itemId,
-        chunk.start,
-        chunk.end,
-        signal
-      );
+      const points = await fetchCanliDovizChunkWithRetry(itemId, chunk.start, chunk.end, signal);
       allPoints.push(...points);
     } catch (error) {
       if (error?.name === 'AbortError') throw error;
-      failedChunks.push({
-        start: chunk.start,
-        end: chunk.end,
-        error: error?.message || String(error)
-      });
+      failedChunks.push({ start: chunk.start, end: chunk.end, error: error?.message || String(error) });
     }
   }
 
-  const points = dedupePoints(allPoints);
-
+  const points = dedupePoints(allPoints, start, end);
   if (!points.length && failedChunks.length) {
-    return {
-      id: bank.id,
-      name: bank.name,
-      points: [],
-      error: `${failedChunks.length} tarih bölümü alınamadı.`
-    };
+    return { id: bank.id, name: bank.name, points: [], error: `${failedChunks.length} tarih bölümü alınamadı.` };
   }
 
   return {
     id: bank.id,
     name: bank.name,
     points,
-    warning: failedChunks.length
-      ? `${failedChunks.length} tarih bölümü alınamadı.`
-      : null
+    warning: failedChunks.length ? `${failedChunks.length} tarih bölümü alınamadı.` : null
   };
 }
 
 async function fetchRows(url, signal) {
-  const response = await fetch(url, {
-    headers: { Accept: 'application/json' },
-    signal
-  });
-
+  const response = await fetch(url, { headers: { Accept: 'application/json' }, signal });
   if (!response.ok) {
     const details = (await response.text()).slice(0, 300);
     throw new Error(`HTTP ${response.status}: ${details}`);
   }
-
   const payload = await response.json();
   return Array.isArray(payload) ? payload : [];
 }
@@ -340,10 +289,7 @@ async function fetchRows(url, signal) {
 function normalizePoints(rows, quote, divisor = 1) {
   return rows
     .filter((row) => String(row?.quote || '').toUpperCase() === quote && Number.isFinite(Number(row?.rate)))
-    .map((row) => ({
-      date: row.date,
-      value: Number(row.rate) / divisor
-    }))
+    .map((row) => ({ date: row.date, value: Number(row.rate) / divisor }))
     .filter((point) => DATE_RE.test(point.date || '') && Number.isFinite(point.value))
     .sort((a, b) => a.date.localeCompare(b.date));
 }
@@ -352,13 +298,10 @@ router.get('/api/history/banks', async (req, res) => {
   const start = String(req.query.start || '');
   const end = String(req.query.end || '');
   const pair = String(req.query.pair || 'USD/TRY').toUpperCase();
-
   res.set('Cache-Control', 'no-store');
 
   const validationError = validateRange(start, end, pair);
-  if (validationError) {
-    return res.status(400).json({ error: validationError });
-  }
+  if (validationError) return res.status(400).json({ error: validationError });
 
   const cacheKey = `banks:${pair}:${start}:${end}`;
   const cached = getCached(bankCache, cacheKey);
@@ -368,33 +311,23 @@ router.get('/api/history/banks', async (req, res) => {
   const timeout = setTimeout(() => controller.abort(), timeoutForRange(start, end));
 
   try {
-    const series = await Promise.all(
-      BANKS.map(async (bank) => {
-        try {
-          return await fetchBankSeries(bank, pair, start, end, controller.signal);
-        } catch (error) {
-          return {
-            id: bank.id,
-            name: bank.name,
-            points: [],
-            error: error?.name === 'AbortError'
-              ? 'Zaman aşımı.'
-              : (error?.message || String(error))
-          };
-        }
-      })
-    );
+    const series = await Promise.all(BANKS.map(async (bank) => {
+      try {
+        return await fetchBankSeries(bank, pair, start, end, controller.signal);
+      } catch (error) {
+        return {
+          id: bank.id,
+          name: bank.name,
+          points: [],
+          error: error?.name === 'AbortError' ? 'Zaman aşımı.' : (error?.message || String(error))
+        };
+      }
+    }));
 
     const populated = series.filter((item) => item.points.length > 0);
     if (!populated.length) {
-      const errors = series
-        .map((item) => `${item.name}: ${item.error || item.warning || 'veri yok'}`)
-        .join(' | ');
-
-      return res.status(502).json({
-        error: `Üç bankadan da geçmiş veri alınamadı. ${errors}`,
-        series
-      });
+      const errors = series.map((item) => `${item.name}: ${item.error || item.warning || 'veri yok'}`).join(' | ');
+      return res.status(502).json({ error: `Üç bankadan da geçmiş veri alınamadı. ${errors}`, series });
     }
 
     const result = {
@@ -408,7 +341,10 @@ router.get('/api/history/banks', async (req, res) => {
       series
     };
 
-    setCached(bankCache, cacheKey, result, cacheTtlMs(end));
+    // A transient chunk failure must not poison the cache for hours.
+    const complete = series.every((item) => !item.error && !item.warning);
+    if (complete) setCached(bankCache, cacheKey, result, cacheTtlMs(end));
+
     return res.json(result);
   } finally {
     clearTimeout(timeout);
@@ -419,13 +355,10 @@ router.get('/api/history/reference', async (req, res) => {
   const start = String(req.query.start || '');
   const end = String(req.query.end || '');
   const pair = String(req.query.pair || 'USD/TRY').toUpperCase();
-
   res.set('Cache-Control', 'no-store');
 
   const validationError = validateRange(start, end, pair);
-  if (validationError) {
-    return res.status(400).json({ error: validationError });
-  }
+  if (validationError) return res.status(400).json({ error: validationError });
 
   const cacheKey = `reference:${pair}:${start}:${end}`;
   const cached = getCached(referenceCache, cacheKey);
@@ -446,7 +379,6 @@ router.get('/api/history/reference', async (req, res) => {
       url.searchParams.set('to', end);
       url.searchParams.set('base', 'XAU');
       url.searchParams.set('quotes', 'TRY');
-
       rows = await fetchRows(url, controller.signal);
       source = 'Altın referans kuru (Frankfurter resmi kaynak harmanı)';
       divisor = GRAMS_PER_TROY_OUNCE;
@@ -456,7 +388,6 @@ router.get('/api/history/reference', async (req, res) => {
       tcmbUrl.searchParams.set('to', end);
       tcmbUrl.searchParams.set('base', base);
       tcmbUrl.searchParams.set('quotes', 'TRY');
-
       rows = await fetchRows(tcmbUrl, controller.signal);
       source = 'TCMB';
 
@@ -466,22 +397,19 @@ router.get('/api/history/reference', async (req, res) => {
         fallbackUrl.searchParams.set('to', end);
         fallbackUrl.searchParams.set('base', base);
         fallbackUrl.searchParams.set('quotes', 'TRY');
-
         rows = await fetchRows(fallbackUrl, controller.signal);
         source = 'Frankfurter resmi kaynak harmanı';
       }
     }
 
-    const points = normalizePoints(rows, quote, divisor);
+    const points = normalizePoints(rows, quote, divisor).filter((point) => point.date >= start && point.date <= end);
     const result = { source, pair, start, end, points };
-
     setCached(referenceCache, cacheKey, result, cacheTtlMs(end));
     return res.json(result);
   } catch (error) {
     const message = error?.name === 'AbortError'
       ? 'Geçmiş kur servisi zaman aşımına uğradı.'
       : `Geçmiş kur verisi alınamadı: ${error?.message || error}`;
-
     return res.status(502).json({ error: message });
   } finally {
     clearTimeout(timeout);
@@ -489,3 +417,11 @@ router.get('/api/history/reference', async (req, res) => {
 });
 
 module.exports = router;
+module.exports._test = {
+  parseDateOnly,
+  validateRange,
+  splitDateRange,
+  parseCanliDovizHistory,
+  dedupePoints,
+  rangeDays
+};
